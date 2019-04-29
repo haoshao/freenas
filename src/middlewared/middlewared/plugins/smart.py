@@ -1,4 +1,6 @@
 import functools
+import re
+import syslog
 from itertools import chain
 
 from middlewared.common.camcontrol import camcontrol_list
@@ -295,6 +297,100 @@ class SMARTTestService(CRUDService):
         await self._service_change('smartd', 'restart')
 
         return response
+
+    @accepts(
+        List(
+            'disks', items=[
+                Dict(
+                    'disk_run',
+                    Str('identifier', required=True),
+                    Str('mode', enum=['FOREGROUND', 'BACKGROUND'], default='BACKGROUND'),
+                    Str('type', enum=['LONG', 'SHORT', 'CONVEYANCE', 'OFFLINE'], required=True),
+                )
+            ]
+        )
+    )
+    async def manual_test(self, disks):
+        verrors = ValidationErrors()
+        if not disks:
+            verrors.add(
+                'manual_test.disks',
+                'Please specify at least one disk.'
+            )
+        else:
+            test_disks_list = []
+            disks_data = await self.middleware.call('disk.query')
+            devices = await camcontrol_list()
+
+            for disk in disks:
+                for d in disks_data:
+                    if disk['identifier'] == d['identifier']:
+                        current_disk = d
+                        test_disks_list.append({
+                            'disk': current_disk['name'],
+                            **disk
+                        })
+                        break
+                else:
+                    verrors.add(
+                        'manual_test.disks.identifier',
+                        f'{disk["identifier"]} is not valid. Please provide a valid disk identifier.'
+                    )
+                    continue
+
+                if current_disk['name'] is None or current_disk['name'].startswith('nvd'):
+                    verrors.add(
+                        'manual_test.disks.identifier',
+                        f'Test cannot be performed for {disk["identifier"]} disk. Failed to retrieve name.'
+                    )
+
+                device = devices.get(current_disk['name'])
+                if not device:
+                    verrors.add(
+                        'manual_test.disks.identifier',
+                        f'Test cannot be performed for {disk["identifier"]}. Unable to retrieve disk details.'
+                    )
+
+        verrors.check()
+
+        return list(
+            await asyncio_map(functools.partial(self.__manual_test, devices), test_disks_list, 16)
+        )
+
+    @staticmethod
+    async def __manual_test(devices, disk):
+        device = devices.get(disk['disk'])
+        args = await get_smartctl_args(disk['disk'], device)
+
+        proc = await run(
+            list(
+                filter(bool, ['smartctl', '-t', disk['type'].lower(), '-C' if disk['mode'] == 'FOREGROUND' else None])
+            ) + args,
+            check=False, encoding='utf8'
+        )
+
+        output = {}
+        if proc.returncode:
+            output['error'] = proc.stderr
+            syslog.openlog('smartctl', facility=syslog.LOG_DAEMON)
+            syslog.syslog(
+                syslog.LOG_WARNING,
+                f'Self test run for /dev/{disk["disk"]} failed with {proc.returncode} return code'
+            )
+            syslog.closelog()
+        else:
+            time_details = re.findall('test will complete after(.*)', proc.stdout, re.IGNORECASE)
+            if not time_details:
+                output['error'] = f'Failed to parse smartctl self test details for {disk["identifier"]}.'
+            else:
+                output['Expected Result Time'] = time_details[0].strip()
+                # TODO: Let's setup alerts please as suggested by Vlad
+
+        return {
+            'disk': disk['disk'],
+            'identifier': disk['identifier'],
+            **output
+        }
 
     @filterable
     async def results(self, filters, options):
