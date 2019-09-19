@@ -24,7 +24,6 @@
 #
 ######################################################################
 import logging
-import os
 import time
 
 from django.conf import settings
@@ -36,7 +35,6 @@ from freenasUI import choices
 from freenasUI.freeadmin.models import DictField, EncryptedDictField, ListField, Model
 from freenasUI.middleware.notifier import notifier
 from freenasUI.support.utils import get_license
-from licenselib.license import ContractType
 
 log = logging.getLogger('system.models')
 
@@ -86,7 +84,8 @@ class Settings(Model):
         verbose_name=_('WebGUI HTTP -> HTTPS Redirect'),
         default=False,
         help_text=_(
-            'Redirect all incoming HTTP requests to HTTPS'
+            'Redirect all incoming HTTP requests to HTTPS and '
+            'enable the HTTP Strict Transport Security (HSTS) header.'
         ),
     )
     stg_language = models.CharField(
@@ -139,6 +138,10 @@ class Settings(Model):
     stg_pwenc_check = models.CharField(
         max_length=100,
         editable=False,
+    )
+    stg_usage_collection = models.NullBooleanField(
+        verbose_name=_("Usage collection"),
+        help_text=_("Enable sending anonymous usage collection to iXsystems"),
     )
 
     class Meta:
@@ -215,6 +218,11 @@ class NTPServer(Model):
 
 
 class Advanced(Model):
+    adv_legacy_ui = models.BooleanField(
+        verbose_name=_('Enable legacy UI'),
+        default=False,
+        help_text=_('Enable or disable the legacy UI.')
+    )
     adv_consolemenu = models.BooleanField(
         verbose_name=_("Show Text Console without Password Prompt"),
         default=False,
@@ -355,6 +363,15 @@ class Email(Model):
             "sending address for mail it sends, eg: freenas@example.com"
         ),
         default='',
+    )
+    em_fromname = models.CharField(
+        max_length=120,
+        verbose_name=_("From name"),
+        help_text=_(
+            "A name which will be displayed in the \"From\" header of e-mail message"
+        ),
+        default='',
+        blank=True,
     )
     em_outgoingserver = models.CharField(
         max_length=120,
@@ -825,13 +842,10 @@ class Support(Model):
             except IndexError:
                 support = cls.objects.create()
 
-        license, error = get_license()
+        license = get_license()[0]
         if license is None:
             return False, support
-        if license.contract_type in (
-            ContractType.silver,
-            ContractType.gold,
-        ):
+        if license['contract_type'] in ('SILVER', 'GOLD'):
             return True, support
         return False, support
 

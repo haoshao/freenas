@@ -6,23 +6,28 @@ from .pipe import Pipes, Pipe
 from .restful import RESTfulAPI
 from .schema import Error as SchemaError
 from .service import CallError, CallException, ValidationError, ValidationErrors
+from .service_exception import adapt_exception
 from .utils import start_daemon_thread, LoadPluginsMixin
 from .utils.debug import get_threads_stacks
 from .utils.lock import SoftHardSemaphore, SoftHardSemaphoreLimit
+from .utils.io_thread_pool_executor import IoThreadPoolExecutor
 from .webui_auth import WebUIAuth
 from .worker import main_worker, worker_init
 from aiohttp import web
 from aiohttp.web_exceptions import HTTPPermanentRedirect
 from aiohttp.web_middlewares import normalize_path_middleware
 from aiohttp_wsgi import WSGIHandler
+from bsd import closefrom
 from bsd.threading import set_thread_name
 from collections import defaultdict
 
 import argparse
 import asyncio
+import atexit
 import binascii
 import concurrent.futures
 import concurrent.futures.process
+import concurrent.futures.thread
 import errno
 import functools
 import inspect
@@ -30,11 +35,13 @@ import linecache
 import multiprocessing
 import os
 import pickle
+import re
 import queue
 import select
 import setproctitle
 import signal
 import sys
+import termios
 import threading
 import time
 import traceback
@@ -76,9 +83,7 @@ class Application(object):
         self.__callbacks[name].append(method)
 
     def _send(self, data):
-        asyncio.run_coroutine_threadsafe(self.response.send_json(
-            data, dumps=json.dumps
-        ), loop=self.loop)
+        asyncio.run_coroutine_threadsafe(self.response.send_str(json.dumps(data)), loop=self.loop)
 
     def _tb_error(self, exc_info):
         klass, exc, trace = exc_info
@@ -194,13 +199,17 @@ class Application(object):
             # send errors to the client
             self.send_error(message, e.errno, str(e), sys.exc_info(), extra=e.extra)
         except Exception as e:
-            self.send_error(message, errno.EINVAL, str(e), sys.exc_info())
-            if not self._py_exceptions:
-                self.logger.warn('Exception while calling {}(*{})'.format(
-                    message['method'],
-                    self.middleware.dump_args(message.get('params', []), method_name=message['method'])
-                ), exc_info=True)
-                asyncio.ensure_future(self.__crash_reporting(sys.exc_info()))
+            adapted = adapt_exception(e)
+            if adapted:
+                self.send_error(message, adapted.errno, str(adapted), sys.exc_info(), extra=adapted.extra)
+            else:
+                self.send_error(message, errno.EINVAL, str(e), sys.exc_info())
+                if not self._py_exceptions:
+                    self.logger.warn('Exception while calling {}(*{})'.format(
+                        message['method'],
+                        self.middleware.dump_args(message.get('params', []), method_name=message['method'])
+                    ), exc_info=True)
+                    asyncio.ensure_future(self.__crash_reporting(sys.exc_info()))
 
     async def __crash_reporting(self, exc_info):
         if self.middleware.crash_reporting.is_disabled():
@@ -258,6 +267,7 @@ class Application(object):
         elif ident in self.__event_sources:
             event_source = self.__event_sources[ident]['event_source']
             await self.middleware.run_in_thread(event_source.cancel)
+            self.__event_sources.pop(ident)
 
     def send_event(self, name, event_type, **kwargs):
         if (
@@ -496,22 +506,25 @@ class FileApplication(object):
             return resp
 
         def copy():
-            while True:
-                read = asyncio.run_coroutine_threadsafe(
-                    filepart.read_chunk(1048576),
-                    loop=self.loop,
-                ).result()
-                if read == b'':
-                    break
-                job.pipes.input.w.write(read)
+            try:
+                try:
+                    while True:
+                        read = asyncio.run_coroutine_threadsafe(
+                            filepart.read_chunk(1048576),
+                            loop=self.loop,
+                        ).result()
+                        if read == b'':
+                            break
+                        job.pipes.input.w.write(read)
+                finally:
+                    job.pipes.input.w.close()
+            except BrokenPipeError:
+                pass
 
         try:
             job = await self.middleware.call(data['method'], *(data.get('params') or []),
                                              pipes=Pipes(input=self.middleware.pipe()))
-            try:
-                await self.middleware.run_in_thread(copy)
-            finally:
-                await self.middleware.run_in_thread(job.pipes.input.w.close)
+            await self.middleware.run_in_thread(copy)
         except CallError as e:
             if e.errno == CallError.ENOMETHOD:
                 status_code = 422
@@ -550,13 +563,8 @@ class ShellWorkerThread(threading.Thread):
 
         self.shell_pid, master_fd = os.forkpty()
         if self.shell_pid == 0:
-            for i in range(3, 1024):
-                if i == master_fd:
-                    continue
-                try:
-                    os.close(i)
-                except Exception:
-                    pass
+            closefrom(3)
+
             os.chdir('/root')
             cmd = [
                 '/usr/bin/login', '-fp', 'root',
@@ -575,6 +583,11 @@ class ShellWorkerThread(threading.Thread):
                 'LANG': 'en_US.UTF-8',
                 'PATH': '/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:/root/bin',
             })
+
+        # Terminal baudrate affects input queue size
+        attr = termios.tcgetattr(master_fd)
+        attr[4] = attr[5] = termios.B921600
+        termios.tcsetattr(master_fd, termios.TCSANOW, attr)
 
         def reader():
             """
@@ -745,23 +758,28 @@ class Middleware(LoadPluginsMixin):
     def __init__(
         self, loop_debug=False, loop_monitor=True, overlay_dirs=None, debug_level=None,
         log_handler=None, startup_seq_path=None,
+        log_format='[%(asctime)s] (%(levelname)s) %(name)s.%(funcName)s():%(lineno)d - %(message)s'
     ):
         super().__init__(overlay_dirs)
-        self.logger = logger.Logger('middlewared', debug_level).getLogger()
+        self.logger = logger.Logger(
+            'middlewared', debug_level, log_format
+        ).getLogger()
         self.crash_reporting = logger.CrashReporting()
         self.crash_reporting_semaphore = asyncio.Semaphore(value=2)
         self.loop_debug = loop_debug
         self.loop_monitor = loop_monitor
         self.debug_level = debug_level
         self.log_handler = log_handler
+        self.log_format = log_format
         self.startup_seq = 0
         self.startup_seq_path = startup_seq_path
         self.app = None
-        self.__loop = None
+        self.loop = None
         self.__thread_id = threading.get_ident()
         # Spawn new processes for ProcessPool instead of forking
         multiprocessing.set_start_method('spawn')
-        self.__threadpool = concurrent.futures.ThreadPoolExecutor(
+        self.__io_threadpool = IoThreadPoolExecutor('IoThread', 20)
+        self.__ws_threadpool = concurrent.futures.ThreadPoolExecutor(
             initializer=lambda: set_thread_name('threadpool_ws'),
             max_workers=10,
         )
@@ -774,6 +792,7 @@ class Middleware(LoadPluginsMixin):
         self.__server_threads = []
         self.__init_services()
         self.__console_io = False if os.path.exists(self.CONSOLE_ONCE_PATH) else None
+        self.__terminate_task = None
         self.jobs = JobsQueue(self)
 
     def __init_services(self):
@@ -848,7 +867,7 @@ class Middleware(LoadPluginsMixin):
                     method_name = f'{service_name}.{task_name}'
                     self.logger.debug(f"Setting up periodic task {method_name} to run every {method._periodic.interval} seconds")
 
-                    self.__loop.call_later(
+                    self.loop.call_later(
                         delay,
                         functools.partial(
                             self.__call_periodic_task,
@@ -857,7 +876,7 @@ class Middleware(LoadPluginsMixin):
                     )
 
     def __call_periodic_task(self, method, service_name, service_obj, method_name, interval):
-        self.__loop.create_task(self.__periodic_task_wrapper(method, service_name, service_obj, method_name, interval))
+        self.loop.create_task(self.__periodic_task_wrapper(method, service_name, service_obj, method_name, interval))
 
     async def __periodic_task_wrapper(self, method, service_name, service_obj, method_name, interval):
         self.logger.trace("Calling periodic task %s", method_name)
@@ -866,7 +885,7 @@ class Middleware(LoadPluginsMixin):
         except Exception:
             self.logger.warning("Exception while calling periodic task", exc_info=True)
 
-        self.__loop.call_later(
+        self.loop.call_later(
             interval,
             functools.partial(
                 self.__call_periodic_task,
@@ -980,6 +999,9 @@ class Middleware(LoadPluginsMixin):
             except Exception:
                 self.logger.error('Failed to run hook {}:{}(*{}, **{})'.format(name, hook['method'], args, kwargs), exc_info=True)
 
+    def call_hook_sync(self, name, *args, **kwargs):
+        return self.run_coroutine(self.call_hook(name, *args, **kwargs))
+
     def register_event_source(self, name, event_source):
         if not issubclass(event_source, EventSource):
             raise RuntimeError(f'{event_source} is not EventSource subclass')
@@ -1000,7 +1022,7 @@ class Middleware(LoadPluginsMixin):
 
     async def _run_in_conn_threadpool(self, method, *args, **kwargs):
         """
-        Threads to handle websocket connection are gated on `__threadpool`.
+        Threads to handle websocket connection are gated on `__ws_threadpool`.
         Any other calls should use `run_in_thread` as that launches its own thread
         and does not cause deadlock waiting another thread to finish in the pool
         (which could happen on the stack call, e.g.
@@ -1008,7 +1030,7 @@ class Middleware(LoadPluginsMixin):
            uses the thread pool. If service.foo is called many times before each thread
            finishes we will have a deadlock)
         """
-        return await self.run_in_executor(self.__threadpool, method, *args, **kwargs)
+        return await self.run_in_executor(self.__ws_threadpool, method, *args, **kwargs)
 
     def __init_procpool(self):
         self.__procpool = concurrent.futures.ProcessPoolExecutor(
@@ -1029,14 +1051,7 @@ class Middleware(LoadPluginsMixin):
                 self.__init_procpool()
 
     async def run_in_thread(self, method, *args, **kwargs):
-        executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            initializer=lambda: set_thread_name('io_thread'),
-        )
-        try:
-            return await self.loop.run_in_executor(executor, functools.partial(method, *args, **kwargs))
-        finally:
-            executor.shutdown(wait=False)
+        return await self.loop.run_in_executor(self.__io_threadpool, functools.partial(method, *args, **kwargs))
 
     def pipe(self):
         return Pipe(self)
@@ -1162,7 +1177,7 @@ class Middleware(LoadPluginsMixin):
         if threading.get_ident() == self.__thread_id:
             raise RuntimeError('You cannot call_sync or run_coroutine from main thread')
 
-        fut = asyncio.run_coroutine_threadsafe(coro, self.__loop)
+        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
         if not wait:
             return fut
 
@@ -1175,7 +1190,7 @@ class Middleware(LoadPluginsMixin):
 
         # In case middleware dies while we are waiting for a `call_sync` result
         while not event.wait(1):
-            if not self.__loop.is_running():
+            if not self.loop.is_running():
                 raise RuntimeError('Middleware is terminating')
         return fut.result()
 
@@ -1228,7 +1243,7 @@ class Middleware(LoadPluginsMixin):
         ws = web.WebSocketResponse()
         await ws.prepare(request)
 
-        connection = Application(self, self.__loop, request, ws)
+        connection = Application(self, self.loop, request, ws)
         connection.on_open()
 
         try:
@@ -1243,6 +1258,14 @@ class Middleware(LoadPluginsMixin):
             await connection.on_close()
         return ws
 
+    _loop_monitor_ignore_frames = (
+        (
+            re.compile(r'\s+File ".+/middlewared/main\.py", line [0-9]+, in run_in_thread\s+'
+                       'return await self.loop.run_in_executor'),
+            'run_in_thread'
+        ),
+    )
+
     def _loop_monitor_thread(self):
         """
         Thread responsible for checking current tasks that are taking too long
@@ -1255,14 +1278,19 @@ class Middleware(LoadPluginsMixin):
         last = None
         while True:
             time.sleep(2)
-            current = asyncio.current_task(loop=self.__loop)
+            current = asyncio.current_task(loop=self.loop)
             if current is None:
                 last = None
                 continue
             if last == current:
                 frame = sys._current_frames()[self.__thread_id]
-                stack = traceback.format_stack(frame, limit=-10)
-                self.logger.warn(''.join(['Task seems blocked:\n'] + stack))
+                stack = traceback.format_stack(frame, limit=10)
+                for regex, name in self._loop_monitor_ignore_frames:
+                    if any(regex.match(s) for s in stack):
+                        self.logger.warn('%s seems to be blocking event loop', name)
+                        break
+                else:
+                    self.logger.warn(''.join(['Task seems blocked:\n'] + stack))
             last = current
 
     def run(self):
@@ -1270,19 +1298,28 @@ class Middleware(LoadPluginsMixin):
         self._console_write('starting')
 
         set_thread_name('asyncio_loop')
-        self.loop = self.__loop = asyncio.get_event_loop()
+        self.loop = asyncio.get_event_loop()
 
         if self.loop_debug:
-            self.__loop.set_debug(True)
-            self.__loop.slow_callback_duration = 0.2
+            self.loop.set_debug(True)
+            self.loop.slow_callback_duration = 0.2
 
+        self.loop.create_task(self.__initialize())
+
+        try:
+            self.loop.run_forever()
+        except RuntimeError as e:
+            if e.args[0] != "Event loop is closed":
+                raise
+
+    async def __initialize(self):
         self.app = app = web.Application(middlewares=[
             normalize_path_middleware(redirect_class=HTTPPermanentRedirect)
-        ], loop=self.__loop)
+        ], loop=self.loop)
 
         # Needs to happen after setting debug or may cause race condition
         # http://bugs.python.org/issue30805
-        self.__loop.run_until_complete(self.__plugins_load())
+        await self.__plugins_load()
 
         self._console_write('registering services')
 
@@ -1293,17 +1330,17 @@ class Middleware(LoadPluginsMixin):
             t.setDaemon(True)
             t.start()
 
-        self.__loop.add_signal_handler(signal.SIGINT, self.terminate)
-        self.__loop.add_signal_handler(signal.SIGTERM, self.terminate)
-        self.__loop.add_signal_handler(signal.SIGUSR1, self.pdb)
-        self.__loop.add_signal_handler(signal.SIGUSR2, self.log_threads_stacks)
+        self.loop.add_signal_handler(signal.SIGINT, self.terminate)
+        self.loop.add_signal_handler(signal.SIGTERM, self.terminate)
+        self.loop.add_signal_handler(signal.SIGUSR1, self.pdb)
+        self.loop.add_signal_handler(signal.SIGUSR2, self.log_threads_stacks)
 
         app.router.add_route('GET', '/websocket', self.ws_handler)
 
         app.router.add_route('*', '/api/docs{path_info:.*}', WSGIHandler(apidocs_app))
         app.router.add_route('*', '/ui{path_info:.*}', WebUIAuth(self))
 
-        self.fileapp = FileApplication(self, self.__loop)
+        self.fileapp = FileApplication(self, self.loop)
         app.router.add_route('*', '/_download{path_info:.*}', self.fileapp.download)
         app.router.add_route('*', '/_upload{path_info:.*}', self.fileapp.upload)
 
@@ -1311,9 +1348,7 @@ class Middleware(LoadPluginsMixin):
         app.router.add_route('*', '/_shell{path_info:.*}', shellapp.ws_handler)
 
         restful_api = RESTfulAPI(self, app)
-        self.__loop.run_until_complete(
-            asyncio.ensure_future(restful_api.register_resources())
-        )
+        await restful_api.register_resources()
         asyncio.ensure_future(self.jobs.run())
 
         self.__setup_periodic_tasks()
@@ -1322,39 +1357,34 @@ class Middleware(LoadPluginsMixin):
         self.__procpool._start_queue_management_thread()
 
         runner = web.AppRunner(app, handle_signals=False, access_log=None)
-        self.__loop.run_until_complete(runner.setup())
-        self.__loop.run_until_complete(
-            web.TCPSite(runner, '0.0.0.0', 6000, reuse_address=True, reuse_port=True).start()
-        )
-        self.__loop.run_until_complete(web.UnixSite(runner, '/var/run/middlewared.sock').start())
+        await runner.setup()
+        await web.TCPSite(runner, '0.0.0.0', 6000, reuse_address=True, reuse_port=True).start()
+        await web.UnixSite(runner, '/var/run/middlewared.sock').start()
 
         self.logger.debug('Accepting connections')
         self._console_write('loading completed\n')
 
-        try:
-            self.__loop.run_forever()
-        except RuntimeError as e:
-            if e.args[0] != "Event loop is closed":
-                raise
-
     def terminate(self):
         self.logger.info('Terminating')
-        self.__loop.create_task(self.__terminate())
+        self.__terminate_task = self.loop.create_task(self.__terminate())
 
     async def __terminate(self):
         for service_name, service in self.get_services().items():
             # We're using this instead of having no-op `terminate`
             # in base class to reduce number of awaits
             if hasattr(service, "terminate"):
+                self.logger.trace("Terminating %r", service)
                 try:
                     await asyncio.wait_for(service.terminate(), 10)
                 except Exception:
                     self.logger.error('Failed to terminate %s', service_name, exc_info=True)
 
-        for task in asyncio.all_tasks(loop=self.__loop):
-            task.cancel()
+        for task in asyncio.all_tasks(loop=self.loop):
+            if task != self.__terminate_task:
+                self.logger.trace("Canceling %r", task)
+                task.cancel()
 
-        self.__loop.stop()
+        self.loop.stop()
 
 
 def main():
@@ -1399,6 +1429,9 @@ def main():
                     raise
 
     logger.setup_logging('middleware', args.debug_level, args.log_handler)
+
+    atexit.unregister(concurrent.futures.process._python_exit)
+    atexit.unregister(concurrent.futures.thread._python_exit)
 
     setproctitle.setproctitle('middlewared')
     # Workaround to tell django to not set up logging on its own

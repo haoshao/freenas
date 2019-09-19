@@ -1,8 +1,8 @@
 from middlewared.schema import accepts, Any, Bool, Dict, Int, List, Patch, Str
 from middlewared.service import (
-    CallError, CRUDService, ValidationErrors, item_method, no_auth_required, pass_app, private
+    CallError, CRUDService, ValidationErrors, item_method, no_auth_required, pass_app, private, filterable
 )
-from middlewared.utils import run
+from middlewared.utils import run, filter_list
 from middlewared.validators import Email
 
 import asyncio
@@ -74,6 +74,10 @@ class UserService(CRUDService):
     @private
     async def user_extend(self, user):
 
+        # Normalize email, empty is really null
+        if user['email'] == '':
+            user['email'] = None
+
         # Get group membership
         user['groups'] = [gm['group']['id'] for gm in await self.middleware.call('datastore.query', 'account.bsdgroupmembership', [('user', '=', user['id'])], {'prefix': 'bsdgrpmember_'})]
 
@@ -88,10 +92,53 @@ class UserService(CRUDService):
                 pass
         return user
 
+    @private
+    async def user_compress(self, user):
+        if 'local' in user:
+            user.pop('local')
+        return user
+
+    @filterable
+    async def query(self, filters=None, options=None):
+        """
+        Query users with `query-filters` and `query-options`. As a performance optimization, only local users
+        will be queried by default.
+
+        Users from directory services such as NIS, LDAP, or Active Directory will be included in query results
+        if the option `{'extra': {'search_dscache': True}}` is specified.
+        """
+        if not filters:
+            filters = []
+        filters += self._config.datastore_filters or []
+
+        options = options or {}
+        options['extend'] = self._config.datastore_extend
+        options['extend_context'] = self._config.datastore_extend_context
+        options['prefix'] = self._config.datastore_prefix
+
+        datastore_options = options.copy()
+        datastore_options.pop('count', None)
+        datastore_options.pop('get', None)
+
+        extra = options.get('extra', {})
+        dssearch = extra.pop('search_dscache', False)
+
+        if dssearch:
+            return await self.middleware.call('dscache.query', 'USERS', filters, options)
+
+        result = await self.middleware.call(
+            'datastore.query', self._config.datastore, [], datastore_options
+        )
+        for entry in result:
+            entry.update({'local': True})
+        return await self.middleware.run_in_thread(
+            filter_list, result, filters, options
+        )
+
     @accepts(Dict(
         'user_create',
         Int('uid'),
-        Str('username', required=True),
+        Str('username', required=True, max_length=16),
         Int('group'),
         Bool('group_create', default=False),
         Str('home', default='/nonexistent'),
@@ -104,7 +151,7 @@ class UserService(CRUDService):
         Bool('locked', default=False),
         Bool('microsoft_account', default=False),
         Bool('sudo', default=False),
-        Str('sshpubkey', null=True),
+        Str('sshpubkey', null=True, max_length=None),
         List('groups', default=[]),
         Dict('attributes', additional_attrs=True),
         register=True,
@@ -173,7 +220,13 @@ class UserService(CRUDService):
                 try:
                     os.makedirs(data['home'], mode=int(home_mode, 8))
                     new_homedir = True
-                    os.chown(data['home'], data['uid'], group['gid'])
+                    await self.middleware.call('filesystem.setperm', {
+                        'path': data['home'],
+                        'mode': home_mode,
+                        'uid': data['uid'],
+                        'gid': group['gid'],
+                        'options': {'stripacl': True}
+                    })
                 except FileExistsError:
                     if not os.path.isdir(data['home']):
                         raise CallError(
@@ -182,8 +235,12 @@ class UserService(CRUDService):
                             errno.EEXIST
                         )
 
-                    # If it exists, ensure the user is owner
-                    os.chown(data['home'], data['uid'], group['gid'])
+                    # If it exists, ensure the user is owner.
+                    await self.middleware.call('filesystem.chown', {
+                        'path': data['home'],
+                        'uid': data['uid'],
+                        'gid': group['gid'],
+                    })
                 except OSError as oe:
                     raise CallError(
                         'Failed to create the home directory '
@@ -203,6 +260,7 @@ class UserService(CRUDService):
             data['uid'] = await self.get_next_uid()
 
         pk = None  # Make sure pk exists to rollback in case of an error
+        data = await self.user_compress(data)
         try:
             await self.__set_password(data)
             sshpubkey = data.pop('sshpubkey', None)  # datastore does not have sshpubkey
@@ -232,7 +290,12 @@ class UserService(CRUDService):
                     dest_file = os.path.join(data['home'], f)
                 if not os.path.exists(dest_file):
                     shutil.copyfile(os.path.join(SKEL_PATH, f), dest_file)
-                    os.chown(dest_file, data['uid'], group['gid'])
+                    await self.middleware.call('filesystem.chown', {
+                        'path': dest_file,
+                        'uid': data['uid'],
+                        'gid': group['gid'],
+                        'options': {'recursive': True}
+                    })
 
             data['sshpubkey'] = sshpubkey
             try:
@@ -275,6 +338,7 @@ class UserService(CRUDService):
         await self.__common_validation(verrors, data, 'user_update', pk=pk)
 
         home = data.get('home') or user['home']
+        has_home = home != '/nonexistent'
         # root user (uid 0) is an exception to the rule
         if data.get('sshpubkey') and not home.startswith('/mnt') and user['uid'] != 0:
             verrors.add('user_update.sshpubkey', 'Home directory is not writable, leave this blank"')
@@ -289,8 +353,9 @@ class UserService(CRUDService):
 
         # Copy the home directory if it changed
         if (
+            has_home and
             'home' in data and
-            data['home'] not in (user['home'], '/nonexistent') and
+            data['home'] != user['home'] and
             not data['home'].startswith(f'{user["home"]}/')
         ):
             home_copy = True
@@ -304,7 +369,11 @@ class UserService(CRUDService):
         if home_copy and not os.path.isdir(user['home']):
             try:
                 os.makedirs(user['home'])
-                os.chown(user['home'], user['uid'], group['bsdgrp_gid'])
+                await self.middleware.call('filesystem.chown', {
+                    'path': user['home'],
+                    'uid': user['uid'],
+                    'gid': group['bsdgrp_gid'],
+                })
             except OSError:
                 self.logger.warn('Failed to chown homedir', exc_info=True)
             if not os.path.isdir(user['home']):
@@ -317,6 +386,10 @@ class UserService(CRUDService):
         def set_home_mode():
             if home_mode is not None:
                 try:
+                    # Strip ACL before chmod. This is required when aclmode = restricted
+                    setfacl = subprocess.run(['/bin/setfacl', '-b', user['home']], check=False)
+                    if setfacl.returncode != 0:
+                        self.logger.debug('Failed to strip ACL: %s', setfacl.stderr.decode())
                     os.chmod(user['home'], int(home_mode, 8))
                 except OSError:
                     self.logger.warn('Failed to set homedir mode', exc_info=True)
@@ -338,7 +411,7 @@ class UserService(CRUDService):
                 set_home_mode()
 
             asyncio.ensure_future(self.middleware.run_in_thread(do_home_copy))
-        else:
+        elif has_home:
             set_home_mode()
 
         user.pop('sshpubkey', None)
@@ -348,6 +421,7 @@ class UserService(CRUDService):
             groups = user.pop('groups')
             await self.__set_groups(pk, groups)
 
+        user = await self.user_compress(user)
         await self.middleware.call('datastore.update', 'account.bsdusers', pk, user, {'prefix': 'bsdusr_'})
 
         await self.middleware.call('service.reload', 'user')
@@ -404,6 +478,18 @@ class UserService(CRUDService):
             shell: os.path.basename(shell)
             for shell in shells + ['/usr/sbin/nologin']
         }
+
+    @accepts(Dict(
+        'get_user_obj',
+        Str('username', default=None),
+        Int('uid', default=None)
+    ))
+    async def get_user_obj(self, data):
+        """
+        Returns dictionary containing information from struct passwd for the user specified by either
+        the username or uid. Bypasses user cache.
+        """
+        return await self.middleware.call('dscache.get_uncached_user', data['username'], data['uid'])
 
     @item_method
     @accepts(
@@ -570,10 +656,7 @@ class UserService(CRUDService):
         if password:
             data['unixhash'] = crypted_password(password)
             # See http://samba.org.ru/samba/docs/man/manpages/smbpasswd.5.html
-            if data['locked']:
-                data['smbhash'] = f'{data["username"]}:{data["uid"]}:{"X" * 32}:{nt_password(password)}:[DU         ]:LCT-{int(time.time()):X}:'
-            else:
-                data['smbhash'] = f'{data["username"]}:{data["uid"]}:{"X" * 32}:{nt_password(password)}:[U          ]:LCT-{int(time.time()):X}:'
+            data['smbhash'] = f'{data["username"]}:{data["uid"]}:{"X" * 32}:{nt_password(password)}:[U         ]:LCT-{int(time.time()):X}:'
         else:
             data['unixhash'] = '*'
             data['smbhash'] = '*'
@@ -642,11 +725,22 @@ class UserService(CRUDService):
             os.mkdir(sshpath, mode=0o700)
         if not os.path.isdir(sshpath):
             raise CallError(f'{sshpath} is not a directory')
+
+        # Make extra sure to enforce correct mode on .ssh directory.
+        # stripping the ACL will allow subsequent chmod calls to succeed even if
+        # dataset aclmode is restricted.
+        await self.middleware.call('filesystem.setperm', {
+            'path': sshpath,
+            'mode': str(700),
+            'uid': user['uid'],
+            'gid': group,
+            'options': {'recursive': True, 'stripacl': True}
+        })
+
         with open(keysfile, 'w') as f:
             f.write(pubkey)
             f.write('\n')
-        os.chmod(keysfile, 0o600)
-        await run('/usr/sbin/chown', '-R', f'{user["username"]}:{group}', sshpath, check=False)
+        await self.middleware.call('filesystem.setperm', {'path': keysfile, 'mode': str(600)})
 
 
 class GroupService(CRUDService):
@@ -662,6 +756,49 @@ class GroupService(CRUDService):
         group['users'] = [gm['user']['id'] for gm in await self.middleware.call('datastore.query', 'account.bsdgroupmembership', [('group', '=', group['id'])], {'prefix': 'bsdgrpmember_'})]
         group['users'] += [gmu['id'] for gmu in await self.middleware.call('datastore.query', 'account.bsdusers', [('bsdusr_group_id', '=', group['id'])])]
         return group
+
+    @private
+    async def group_compress(self, group):
+        if 'local' in group:
+            group.pop('local')
+        return group
+
+    @filterable
+    async def query(self, filters=None, options=None):
+        """
+        Query groups with `query-filters` and `query-options`. As a performance optimization, only local groups
+        will be queried by default.
+
+        Groups from directory services such as NIS, LDAP, or Active Directory will be included in query results
+        if the option `{'extra': {'search_dscache': True}}` is specified.
+        """
+        if not filters:
+            filters = []
+        filters += self._config.datastore_filters or []
+
+        options = options or {}
+        options['extend'] = self._config.datastore_extend
+        options['extend_context'] = self._config.datastore_extend_context
+        options['prefix'] = self._config.datastore_prefix
+
+        datastore_options = options.copy()
+        datastore_options.pop('count', None)
+        datastore_options.pop('get', None)
+
+        extra = options.get('extra', {})
+        dssearch = extra.pop('search_dscache', False)
+
+        if dssearch:
+            return await self.middleware.call('dscache.query', 'GROUPS', filters, options)
+
+        result = await self.middleware.call(
+            'datastore.query', self._config.datastore, [], datastore_options
+        )
+        for entry in result:
+            entry.update({'local': True})
+        return await self.middleware.run_in_thread(
+            filter_list, result, filters, options
+        )
 
     @accepts(Dict(
         'group_create',
@@ -695,6 +832,7 @@ class GroupService(CRUDService):
 
         users = group.pop('users', [])
 
+        group = await self.group_compress(group)
         pk = await self.middleware.call('datastore.insert', 'account.bsdgroups', group, {'prefix': 'bsdgrp_'})
 
         for user in users:
@@ -735,6 +873,7 @@ class GroupService(CRUDService):
         else:
             group.pop('name', None)
 
+        group = await self.group_compress(group)
         await self.middleware.call('datastore.update', 'account.bsdgroups', pk, group, {'prefix': 'bsdgrp_'})
 
         if 'users' in data:
@@ -792,6 +931,18 @@ class GroupService(CRUDService):
                 return last_gid + 1
             last_gid = i['gid']
         return last_gid + 1
+
+    @accepts(Dict(
+        'get_group_obj',
+        Str('groupname', default=None),
+        Int('gid', default=None)
+    ))
+    async def get_group_obj(self, data):
+        """
+        Returns dictionary containing information from struct grp for the group specified by either
+        the groupname or gid. Bypasses group cache.
+        """
+        return await self.middleware.call('dscache.get_uncached_group', data['groupname'], data['gid'])
 
     async def __common_validation(self, verrors, data, schema, pk=None):
 

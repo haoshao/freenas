@@ -72,12 +72,12 @@ async def test__ensure_smart_enabled__handled_args_properly():
 
 @pytest.mark.asyncio
 async def test__annotate_disk_for_smart__skips_nvd():
-    assert await annotate_disk_for_smart({}, "/dev/nvd0") is None
+    assert await annotate_disk_for_smart(None, {}, "nvd0") is None
 
 
 @pytest.mark.asyncio
 async def test__annotate_disk_for_smart__skips_unknown_device():
-    assert await annotate_disk_for_smart({"/dev/ada0": {}}, "/dev/ada1") is None
+    assert await annotate_disk_for_smart(None, {"ada0": {}}, "ada1") is None
 
 
 @pytest.mark.asyncio
@@ -85,7 +85,7 @@ async def test__annotate_disk_for_smart__skips_device_without_args():
     with patch("middlewared.etc_files.smartd.get_smartctl_args") as get_smartctl_args:
         get_smartctl_args.return_value = asyncio.Future()
         get_smartctl_args.return_value.set_result(None)
-        assert await annotate_disk_for_smart({"/dev/ada1": {"driver": "ata"}}, "/dev/ada1") is None
+        assert await annotate_disk_for_smart(None, {"ada1": {"driver": "ata"}}, "ada1") is None
 
 
 @pytest.mark.asyncio
@@ -96,7 +96,7 @@ async def test__annotate_disk_for_smart__skips_device_with_unavailable_smart():
         with patch("middlewared.etc_files.smartd.ensure_smart_enabled") as ensure_smart_enabled:
             ensure_smart_enabled.return_value = asyncio.Future()
             ensure_smart_enabled.return_value.set_result(False)
-            assert await annotate_disk_for_smart({"/dev/ada1": {"driver": "ata"}}, "/dev/ada1") is None
+            assert await annotate_disk_for_smart(None, {"ada1": {"driver": "ata"}}, "ada1") is None
 
 
 @pytest.mark.asyncio
@@ -107,9 +107,9 @@ async def test__annotate_disk_for_smart():
         with patch("middlewared.etc_files.smartd.ensure_smart_enabled") as ensure_smart_enabled:
             ensure_smart_enabled.return_value = asyncio.Future()
             ensure_smart_enabled.return_value.set_result(True)
-            assert await annotate_disk_for_smart({"/dev/ada1": {"driver": "ata"}}, "/dev/ada1") == (
-                "/dev/ada1",
-                {"smartctl_args": ["/dev/ada1", "-d", "sat", "-d", "removable"]},
+            assert await annotate_disk_for_smart(None, {"ada1": {"driver": "ata"}}, "ada1") == (
+                "ada1",
+                {"smartctl_args": ["/dev/ada1", "-d", "sat", "-a", "-d", "removable"]},
             )
 
 
@@ -158,6 +158,10 @@ def test__get_smartd_schedule_piece__at_midnight():
     assert get_smartd_schedule_piece("0", 1, 23) == "(00)"
 
 
+def test__get_smartd_schedule_piece__range_with_divisor():
+    assert get_smartd_schedule_piece("3-30/10", 1, 31) == "(10|20|30)"
+
+
 def test__get_smartd_config():
     assert get_smartd_config({
         "smartctl_args": ["/dev/ada0", "-d", "sat"],
@@ -165,7 +169,6 @@ def test__get_smartd_config():
         "smart_difference": 0,
         "smart_informational": 1,
         "smart_critical": 2,
-        "smart_email": "",
         "smarttest_type": "S",
         "smarttest_month": "*/1",
         "smarttest_daymonth": "*/1",
@@ -188,7 +191,6 @@ def test__get_smartd_config_without_schedule():
         "smart_difference": 0,
         "smart_informational": 1,
         "smart_critical": 2,
-        "smart_email": "",
         "disk_smartoptions": "--options",
         "disk_critical": None,
         "disk_difference": None,
@@ -204,7 +206,6 @@ def test__get_smartd_config_with_temp():
         "smart_difference": 0,
         "smart_informational": 1,
         "smart_critical": 2,
-        "smart_email": "",
         "disk_smartoptions": "--options",
         "disk_critical": 50,
         "disk_difference": 10,

@@ -1,3 +1,6 @@
+import os
+
+from middlewared.common.attachment import FSAttachmentDelegate
 from middlewared.schema import accepts, Bool, Cron, Dict, Int, List, Patch, Path, Str
 from middlewared.service import CallError, CRUDService, item_method, private, ValidationErrors
 from middlewared.utils.path import is_child
@@ -36,7 +39,7 @@ class PeriodicSnapshotTaskService(CRUDService):
         )
 
         data['state'] = context['state'].get(f'periodic_snapshot_task_{data["id"]}', {
-            'state': 'UNKNOWN',
+            'state': 'PENDING',
         })
 
         return data
@@ -182,7 +185,7 @@ class PeriodicSnapshotTaskService(CRUDService):
 
         verrors.add_child('periodic_snapshot_update', await self._validate(new))
 
-        if not data['enabled']:
+        if not new['enabled']:
             for replication_task in await self.middleware.call('replication.query', [['enabled', '=', True]]):
                 if any(periodic_snapshot_task['id'] == id
                        for periodic_snapshot_task in replication_task['periodic_snapshot_tasks']):
@@ -333,3 +336,38 @@ class PeriodicSnapshotTaskService(CRUDService):
 
     async def _legacy_replication_tasks(self):
         return await self.middleware.call('replication.query', [['transport', '=', 'LEGACY']])
+
+
+class PeriodicSnapshotTaskFSAttachmentDelegate(FSAttachmentDelegate):
+    name = 'snapshottask'
+    title = 'Snapshot Task'
+
+    async def query(self, path, enabled):
+        results = []
+        for task in await self.middleware.call('pool.snapshottask.query', [['enabled', '=', enabled]]):
+            if is_child(os.path.join('/mnt', task['dataset']), path):
+                results.append(task)
+
+        return results
+
+    async def get_attachment_name(self, attachment):
+        return attachment['dataset']
+
+    async def delete(self, attachments):
+        for attachment in attachments:
+            await self.middleware.call('datastore.delete', 'storage.task', attachment['id'])
+
+        await self.middleware.call('service.restart', 'cron')
+        await self.middleware.call('zettarepl.update_tasks')
+
+    async def toggle(self, attachments, enabled):
+        for attachment in attachments:
+            await self.middleware.call('datastore.update', 'storage.task', attachment['id'], {'task_enabled': enabled})
+
+        await self.middleware.call('service.restart', 'cron')
+        await self.middleware.call('zettarepl.update_tasks')
+
+
+async def setup(middleware):
+    await middleware.call('pool.dataset.register_attachment_delegate',
+                          PeriodicSnapshotTaskFSAttachmentDelegate(middleware))

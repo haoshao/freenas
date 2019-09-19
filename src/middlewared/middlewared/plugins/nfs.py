@@ -1,18 +1,25 @@
 import asyncio
+import contextlib
 import ipaddress
 import os
 import socket
+import subprocess
 
+import sysctl
+
+from middlewared.common.attachment import FSAttachmentDelegate
 from middlewared.schema import accepts, Bool, Dict, Dir, Int, IPAddr, List, Patch, Str
 from middlewared.validators import Range
 from middlewared.service import private, CRUDService, SystemServiceService, ValidationErrors
 from middlewared.utils.asyncio_ import asyncio_map
+from middlewared.utils.path import is_child
 
 
 class NFSService(SystemServiceService):
 
     class Config:
         service = "nfs"
+        service_verb = "restart"
         datastore_prefix = "nfs_srv_"
         datastore_extend = 'nfs.nfs_extend'
 
@@ -119,6 +126,38 @@ class NFSService(SystemServiceService):
 
         return new
 
+    @private
+    def setup_v4(self):
+        config = self.middleware.call_sync("nfs.config")
+
+        if config["v4_krb"]:
+            subprocess.run(["service", "gssd", "onerestart"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.run(["service", "gssd", "forcestop"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        if config["v4"]:
+            sysctl.filter("vfs.nfsd.server_max_nfsvers")[0].value = 4
+            if config["v4_v3owner"]:
+                # Per RFC7530, sending NFSv3 style UID/GIDs across the wire is now allowed
+                # You must have both of these sysctl"s set to allow the desired functionality
+                sysctl.filter("vfs.nfsd.enable_stringtouid")[0].value = 1
+                sysctl.filter("vfs.nfs.enable_uidtostring")[0].value = 1
+                subprocess.run(["service", "nfsuserd", "forcestop"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            else:
+                sysctl.filter("vfs.nfsd.enable_stringtouid")[0].value = 0
+                sysctl.filter("vfs.nfs.enable_uidtostring")[0].value = 0
+                subprocess.run(["service", "nfsuserd", "onerestart"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+        else:
+            sysctl.filter("vfs.nfsd.server_max_nfsvers")[0].value = 3
+            if config["userd_manage_gids"]:
+                subprocess.run(["service", "nfsuserd", "onerestart"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            else:
+                subprocess.run(["service", "nfsuserd", "forcestop"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+
 
 class SharingNFSService(CRUDService):
     class Config:
@@ -130,12 +169,12 @@ class SharingNFSService(CRUDService):
     @accepts(Dict(
         "sharingnfs_create",
         List("paths", items=[Dir("path")], empty=False),
-        Str("comment"),
+        Str("comment", default=""),
         List("networks", items=[IPAddr("network", network=True)], default=[]),
         List("hosts", items=[Str("host")], default=[]),
-        Bool("alldirs"),
-        Bool("ro"),
-        Bool("quiet"),
+        Bool("alldirs", default=False),
+        Bool("ro", default=False),
+        Bool("quiet", default=False),
         Str("maproot_user", required=False, default=None, null=True),
         Str("maproot_group", required=False, default=None, null=True),
         Str("mapall_user", required=False, default=None, null=True),
@@ -145,6 +184,7 @@ class SharingNFSService(CRUDService):
             default=[],
             items=[Str("provider", enum=["SYS", "KRB5", "KRB5I", "KRB5P"])],
         ),
+        Bool("enabled", default=True),
         register=True,
     ))
     async def do_create(self, data):
@@ -244,17 +284,13 @@ class SharingNFSService(CRUDService):
         """
         Delete NFS Share of `id`.
         """
-        await self.middleware.call("datastore.delete", "sharing.nfs_share_path", [["share_id", "=", id]])
         await self.middleware.call("datastore.delete", self._config.datastore, id)
         await self._service_change("nfs", "reload")
 
     @private
     async def validate(self, data, schema_name, verrors, old=None):
-        if not data["paths"]:
-            verrors.add(f"{schema_name}.paths", "At least one path is required")
-
-        if verrors:
-            raise verrors
+        if data["alldirs"] and len(data["paths"]) > 1:
+            verrors.add(f"{schema_name}.alldirs", "This option can only be used for shares that contain single path")
 
         await self.middleware.run_in_thread(self.validate_paths, data, schema_name, verrors)
 
@@ -276,12 +312,17 @@ class SharingNFSService(CRUDService):
             elif not data[f"{k}_user"] and data[f"{k}_group"]:
                 verrors.add(f"{schema_name}.{k}_user", "This field is required when map group is specified")
             else:
-                user = await self.middleware.call("notifier.get_user_object", data[f"{k}_user"])
+                user = group = None
+                with contextlib.suppress(KeyError):
+                    user = await self.middleware.call('dscache.get_uncached_user', data[f'{k}_user'])
+
                 if not user:
                     verrors.add(f"{schema_name}.{k}_user", "User not found")
 
-                if data[f"{k}_group"]:
-                    group = await self.middleware.call("notifier.get_group_object", data[f"{k}_group"])
+                if data[f'{k}_group']:
+                    with contextlib.suppress(KeyError):
+                        group = await self.middleware.call('dscache.get_uncached_group', data[f'{k}_group'])
+
                     if not group:
                         verrors.add(f"{schema_name}.{k}_group", "Group not found")
 
@@ -296,7 +337,6 @@ class SharingNFSService(CRUDService):
     @private
     def validate_paths(self, data, schema_name, verrors):
         dev = None
-        is_mountpoint = False
         for i, path in enumerate(data["paths"]):
             stat = os.stat(path)
             if dev is None:
@@ -305,16 +345,6 @@ class SharingNFSService(CRUDService):
                 if dev != stat.st_dev:
                     verrors.add(f"{schema_name}.paths.{i}",
                                 "Paths for a NFS share must reside within the same filesystem")
-
-            parent = os.path.abspath(os.path.join(path, ".."))
-            if os.stat(parent).st_dev != dev:
-                is_mountpoint = True
-                if any(os.path.abspath(p).startswith(parent + "/") for p in data["paths"] if p != path):
-                    verrors.add(f"{schema_name}.paths.{i}",
-                                "You cannot share a mount point and subdirectories all at once")
-
-        if not is_mountpoint and data["alldirs"]:
-            verrors.add(f"{schema_name}.alldirs", "This option can only be used for datasets")
 
     @private
     async def resolve_hostnames(self, hostnames):
@@ -335,9 +365,6 @@ class SharingNFSService(CRUDService):
 
     @private
     def validate_hosts_and_networks(self, other_shares, data, schema_name, verrors, dns_cache):
-        explanation = (". This is so because /etc/exports does not act like ACL and it is undefined which rule among "
-                       "all overlapping networks will be applied.")
-
         dev = os.stat(data["paths"][0]).st_dev
 
         used_networks = set()
@@ -375,39 +402,28 @@ class SharingNFSService(CRUDService):
                     used_networks.add(ipaddress.ip_network("0.0.0.0/0"))
                     used_networks.add(ipaddress.ip_network("::/0"))
 
-                if share["alldirs"] and data["alldirs"]:
-                    verrors.add(f"{schema_name}.alldirs", "This option is only available once per mountpoint")
-
-        had_explanation = False
         for i, host in enumerate(data["hosts"]):
             host = dns_cache[host]
             if host is None:
                 continue
 
             network = ipaddress.ip_network(host)
-            for another_network in used_networks:
-                if network.overlaps(another_network):
-                    verrors.add(
-                        f"{schema_name}.hosts.{i}",
-                        (f"You can't share same filesystem with overlapping networks {network} and {another_network}" +
-                         ("" if had_explanation else explanation))
-                    )
-                    had_explanation = True
+            if network in used_networks:
+                verrors.add(
+                    f"{schema_name}.hosts.{i}",
+                    "Another NFS share already exports this dataset for this host"
+                )
 
             used_networks.add(network)
 
-        had_explanation = False
         for i, network in enumerate(data["networks"]):
             network = ipaddress.ip_network(network, strict=False)
 
-            for another_network in used_networks:
-                if network.overlaps(another_network):
-                    verrors.add(
-                        f"{schema_name}.networks.{i}",
-                        (f"You can't share same filesystem with overlapping networks {network} and {another_network}" +
-                         ("" if had_explanation else explanation))
-                    )
-                    had_explanation = True
+            if network in used_networks:
+                verrors.add(
+                    f"{schema_name}.networks.{i}",
+                    "Another NFS share already exports this dataset for this network"
+                )
 
             used_networks.add(network)
 
@@ -415,8 +431,7 @@ class SharingNFSService(CRUDService):
             if used_networks:
                 verrors.add(
                     f"{schema_name}.networks",
-                    (f"You can't share same filesystem with all hosts twice" +
-                     ("" if had_explanation else explanation))
+                    "Another NFS share already exports this dataset for some network"
                 )
 
     @private
@@ -448,5 +463,38 @@ async def pool_post_import(middleware, pool):
             break
 
 
+class NFSFSAttachmentDelegate(FSAttachmentDelegate):
+    name = 'nfs'
+    title = 'NFS Share'
+    service = 'nfs'
+
+    async def query(self, path, enabled):
+        results = []
+        for nfs in await self.middleware.call('sharing.nfs.query', [['enabled', '=', enabled]]):
+            if any(is_child(nfs_path, path) for nfs_path in nfs['paths']):
+                results.append(nfs)
+
+        return results
+
+    async def get_attachment_name(self, attachment):
+        return ', '.join(attachment['paths'])
+
+    # NFS share can only contain paths from single dataset, that's why we can delete/disable entire share
+    # if even one path matches
+    async def delete(self, attachments):
+        for attachment in attachments:
+            await self.middleware.call('datastore.delete', 'sharing.nfs_share', attachment['id'])
+
+        await self._service_change('nfs', 'reload')
+
+    async def toggle(self, attachments, enabled):
+        for attachment in attachments:
+            await self.middleware.call('datastore.update', 'sharing.nfs_share', attachment['id'],
+                                       {'nfs_enabled': enabled})
+
+        await self._service_change('nfs', 'reload')
+
+
 async def setup(middleware):
+    await middleware.call('pool.dataset.register_attachment_delegate', NFSFSAttachmentDelegate(middleware))
     middleware.register_hook('pool.post_import_pool', pool_post_import, sync=True)

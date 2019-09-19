@@ -18,7 +18,6 @@ import shutil
 import socket
 import struct
 import subprocess
-import sys
 import sysctl
 import syslog
 import tarfile
@@ -26,12 +25,7 @@ import textwrap
 import time
 import uuid
 
-from licenselib.license import ContractType, Features
-
-# FIXME: Temporary imports until license lives in middlewared
-if '/usr/local/www' not in sys.path:
-    sys.path.append('/usr/local/www')
-from freenasUI.support.utils import get_license
+from licenselib.license import ContractType, Features, License
 
 SYSTEM_BOOT_ID = None
 # Flag telling whether the system completed boot and is ready to use
@@ -41,9 +35,10 @@ SYSTEM_SHUTTING_DOWN = False
 
 CACHE_POOLS_STATUSES = 'system.system_health_pools'
 FIRST_INSTALL_SENTINEL = '/data/first-boot'
+LICENSE_FILE = '/data/license'
 
 
-class SytemAdvancedService(ConfigService):
+class SystemAdvancedService(ConfigService):
 
     class Config:
         datastore = 'system.advanced'
@@ -110,6 +105,7 @@ class SytemAdvancedService(ConfigService):
             'system_advanced_update',
             Bool('advancedmode'),
             Bool('autotune'),
+            Bool('legacy_ui'),
             Int('boot_scrub', validators=[Range(min=1)]),
             Bool('consolemenu'),
             Bool('consolemsg'),
@@ -138,6 +134,8 @@ class SytemAdvancedService(ConfigService):
 
         `autotune` when enabled executes autotune script which attempts to optimize the system based on the installed
         hardware.
+
+        `legacy_ui` is disabled by default. Enabling it allows end users to use the legacy UI.
         """
         config_data = await self.config()
         original_data = config_data.copy()
@@ -205,6 +203,9 @@ class SytemAdvancedService(ConfigService):
             if original_data['fqdn_syslog'] != config_data['fqdn_syslog']:
                 await self.middleware.call('service.restart', 'syslogd', {'onetime': False})
 
+            if original_data['legacy_ui'] != config_data['legacy_ui']:
+                await self.middleware.call('service.reload', 'http')
+
         return await self.config()
 
     @private
@@ -230,14 +231,27 @@ class SystemService(Service):
     @accepts()
     async def is_freenas(self):
         """
-        Returns `true` if running system is a FreeNAS or `false` is Something Else.
+        Returns `true` if running system is a FreeNAS or `false` if something else.
         """
         # This is a stub calling notifier until we have all infrastructure
         # to implement in middlewared
         return await self.middleware.call('notifier.is_freenas')
 
+    @no_auth_required
+    @accepts()
     async def product_name(self):
+        """
+        Returns name of the product we are using (FreeNAS or something else).
+        """
         return "FreeNAS" if await self.middleware.call("system.is_freenas") else "TrueNAS"
+
+    @no_auth_required
+    @accepts()
+    async def legacy_ui_enabled(self):
+        """
+        Returns a boolean value indicating if the legacy UI can be used by end users.
+        """
+        return (await self.middleware.call('system.advanced.config'))['legacy_ui']
 
     @accepts()
     def version(self):
@@ -276,16 +290,39 @@ class SystemService(Service):
             return "READY"
         return "BOOTING"
 
-    async def __get_license(self):
-        licenseobj = get_license()[0]
-        if not licenseobj:
+    def __get_license(self):
+        if not os.path.exists(LICENSE_FILE):
             return
+
+        with open(LICENSE_FILE, 'r') as f:
+            license_file = f.read().strip('\n')
+
+        try:
+            licenseobj = License.load(license_file)
+        except Exception:
+            return
+
         license = {
+            "model": licenseobj.model,
             "system_serial": licenseobj.system_serial,
             "system_serial_ha": licenseobj.system_serial_ha,
             "contract_type": ContractType(licenseobj.contract_type).name.upper(),
+            "contract_start": licenseobj.contract_start,
             "contract_end": licenseobj.contract_end,
+            "legacy_contract_hardware": (
+                licenseobj.contract_hardware.name.upper()
+                if licenseobj.contract_type == ContractType.legacy
+                else None
+            ),
+            "legacy_contract_software": (
+                licenseobj.contract_software.name.upper()
+                if licenseobj.contract_type == ContractType.legacy
+                else None
+            ),
+            "customer_name": licenseobj.customer_name,
+            "expired": licenseobj.expired,
             "features": [],
+            "addhw": licenseobj.addhw,
         }
         for feature in licenseobj.features:
             license["features"].append(feature.name.upper())
@@ -299,6 +336,29 @@ class SystemService(Service):
         ):
             license["features"].append(Features.fibrechannel.name.upper())
         return license
+
+    @private
+    def license_path(self):
+        return LICENSE_FILE
+
+    @accepts(Str('license'))
+    def license_update(self, license):
+        """
+        Update license file.
+        """
+        try:
+            License.load(license)
+        except Exception:
+            raise CallError('This is not a valid license.')
+
+        with open(LICENSE_FILE, 'w+') as f:
+            f.write(license)
+
+        self.middleware.call_sync('etc.generate', 'rc')
+
+        self.middleware.run_coroutine(
+            self.middleware.call_hook('system.post_license_update'), wait=False,
+        )
 
     @accepts()
     async def info(self):
@@ -339,7 +399,7 @@ class SystemService(Service):
             'uptime_seconds': time.clock_gettime(5),  # CLOCK_UPTIME = 5
             'system_serial': serial,
             'system_product': product,
-            'license': await self.__get_license(),
+            'license': await self.middleware.run_in_thread(self.__get_license),
             'boottime': datetime.fromtimestamp(
                 struct.unpack('l', sysctl.filter('kern.boottime')[0].value[:8])[0]
             ),
@@ -358,7 +418,7 @@ class SystemService(Service):
             return False
         elif is_freenas:
             return True
-        license = await self.__get_license()
+        license = await self.middleware.run_in_thread(self.__get_license)
         if license and name in license['features']:
             return True
         return False
@@ -412,9 +472,9 @@ class SystemService(Service):
 
         await Popen(['/sbin/poweroff'])
 
-    @accepts()
-    @job(lock='systemdebug')
-    def debug(self, job):
+    @private
+    @job(lock='system.debug_generate')
+    def debug_generate(self, job):
         """
         Generate system debug file.
 
@@ -446,18 +506,18 @@ class SystemService(Service):
                     int(percent.split()[-1].strip('%')),
                     help.lstrip()
                 )
-        cp.communicate()
+        _, stderr = cp.communicate()
 
         if cp.returncode != 0:
-            raise CallError(f'Failed to generate debug file: {cp.stderr}')
+            raise CallError(f'Failed to generate debug file: {stderr}')
 
         job.set_progress(100, 'Debug generation finished')
 
         return dump
 
     @accepts()
-    @job(lock='systemdebugdownload', pipes=['output'])
-    def debug_download(self, job):
+    @job(lock='system.debug', pipes=['output'])
+    def debug(self, job):
         """
         Job to stream debug file.
 
@@ -465,14 +525,18 @@ class SystemService(Service):
         downloaded via HTTP.
         """
         job.set_progress(0, 'Generating debug file')
-        debug_job = self.middleware.call_sync('system.debug')
+        debug_job = self.middleware.call_sync(
+            'system.debug_generate',
+            job_on_progress_cb=lambda encoded: job.set_progress(int(encoded['progress']['percent'] * 0.9),
+                                                                encoded['progress']['description'])
+        )
 
         standby_debug = None
         is_freenas = self.middleware.call_sync('system.is_freenas')
         if not is_freenas and self.middleware.call_sync('failover.licensed'):
             try:
                 standby_debug = self.middleware.call_sync(
-                    'failover.call_remote', 'system.debug', [], {'job': True}
+                    'failover.call_remote', 'system.debug_generate', [], {'job': True}
                 )
             except Exception:
                 self.logger.warn('Failed to get debug from standby node', exc_info=True)
@@ -550,8 +614,7 @@ class SystemGeneralService(ConfigService):
 
     @private
     async def general_system_extend(self, data):
-        keys = data.keys()
-        for key in keys:
+        for key in list(data.keys()):
             if key.startswith('gui'):
                 data['ui_' + key[3:]] = data.pop(key)
 
@@ -566,6 +629,12 @@ class SystemGeneralService(ConfigService):
         data['crash_reporting_is_set'] = data['crash_reporting'] is not None
         if data['crash_reporting'] is None:
             data['crash_reporting'] = await self.middleware.call("system.is_freenas")
+
+        data['usage_collection_is_set'] = data['usage_collection'] is not None
+        if data['usage_collection'] is None:
+            data['usage_collection'] = await self.middleware.call("system.is_freenas")
+
+        data.pop('pwenc_check')
 
         return data
 
@@ -885,6 +954,7 @@ class SystemGeneralService(ConfigService):
             Str('syslogserver'),
             Str('timezone'),
             Bool('crash_reporting', null=True),
+            Bool('usage_collection', null=True),
             update=True,
         )
     )
@@ -907,6 +977,8 @@ class SystemGeneralService(ConfigService):
         config['ui_certificate'] = config['ui_certificate']['id'] if config['ui_certificate'] else None
         if not config.pop('crash_reporting_is_set'):
             config['crash_reporting'] = None
+        if not config.pop('usage_collection_is_set'):
+            config['usage_collection'] = None
         new_config = config.copy()
         new_config.update(data)
 
@@ -953,6 +1025,14 @@ class SystemGeneralService(ConfigService):
         await self.middleware.call('service.start', 'ssl')
 
         return await self.config()
+
+    @accepts()
+    async def ui_restart(self):
+        """
+        Restart HTTP server to use latest UI settings.
+        """
+        await self.middleware.call('service.restart', 'http')
+        await self.middleware.call('service.restart', 'django')
 
     @accepts()
     async def local_url(self):

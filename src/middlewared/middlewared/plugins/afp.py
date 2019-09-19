@@ -1,12 +1,15 @@
 import asyncio
+import uuid
 
 from middlewared.async_validators import check_path_resides_within_volume
+from middlewared.common.attachment import FSAttachmentDelegate
 from middlewared.schema import (accepts, Bool, Dict, Dir, Int, List, Str,
                                 Patch, UnixPerm)
 from middlewared.validators import IpAddress, Range
 from middlewared.service import (SystemServiceService, ValidationErrors,
                                  CRUDService, private)
 from middlewared.service_exception import CallError
+from middlewared.utils.path import is_child
 import os
 
 
@@ -38,7 +41,7 @@ class AFPService(SystemServiceService):
         List('bindip', items=[Str('ip', validators=[IpAddress()])]),
         Int('connections_limit', validators=[Range(min=1, max=65535)]),
         Dir('dbpath'),
-        Str('global_aux'),
+        Str('global_aux', max_length=None),
         Str('map_acls', enum=['RIGHTS', 'MODE', 'NONE']),
         Str('chmod_request', enum=['PRESERVE', 'SIMPLE', 'IGNORE']),
         update=True
@@ -107,7 +110,9 @@ class SharingAFPService(CRUDService):
         UnixPerm('umask', default='000'),
         List('hostsallow', items=[], default=[]),
         List('hostsdeny', items=[], default=[]),
-        Str('auxparams'),
+        Str('vuid', null=True, default=''),
+        Str('auxparams', max_length=None),
+        Bool('enabled', default=True),
         register=True
     ))
     async def do_create(self, data):
@@ -211,6 +216,11 @@ class SharingAFPService(CRUDService):
     @private
     async def validate(self, data, schema_name, verrors, old=None):
         await self.home_exists(data['home'], schema_name, verrors, old)
+        if data['vuid']:
+            try:
+                uuid.UUID(data['vuid'], version=4)
+            except ValueError:
+                verrors.add(f'{schema_name}.vuid', 'vuid must be a valid UUID.')
 
     @private
     async def home_exists(self, home, schema_name, verrors, old=None):
@@ -288,7 +298,8 @@ class SharingAFPService(CRUDService):
         data['rw'] = ' '.join(data['rw'])
         data['hostsallow'] = ' '.join(data['hostsallow'])
         data['hostsdeny'] = ' '.join(data['hostsdeny'])
-
+        if not data['vuid'] and data['timemachine']:
+            data['vuid'] = str(uuid.uuid4())
         return data
 
 
@@ -306,5 +317,41 @@ async def pool_post_import(middleware, pool):
         asyncio.ensure_future(middleware.call('service.reload', 'afp'))
 
 
+class AFPFSAttachmentDelegate(FSAttachmentDelegate):
+    name = 'afp'
+    title = 'AFP Share'
+    service = 'afp'
+
+    async def query(self, path, enabled):
+        results = []
+        for afp in await self.middleware.call('sharing.afp.query', [['enabled', '=', enabled]]):
+            if is_child(afp['path'], path):
+                results.append(afp)
+
+        return results
+
+    async def get_attachment_name(self, attachment):
+        return attachment['name']
+
+    async def delete(self, attachments):
+        for attachment in attachments:
+            await self.middleware.call('datastore.delete', 'sharing.afp_share', attachment['id'])
+
+        # AFP does not allow us to close specific share forcefully so we have to abort all connections
+        await self._service_change('afp', 'restart')
+
+    async def toggle(self, attachments, enabled):
+        for attachment in attachments:
+            await self.middleware.call('datastore.update', 'sharing.afp_share', attachment['id'],
+                                       {'afp_enabled': enabled})
+
+        if enabled:
+            await self._service_change('afp', 'reload')
+        else:
+            # AFP does not allow us to close specific share forcefully so we have to abort all connections
+            await self._service_change('afp', 'restart')
+
+
 async def setup(middleware):
+    await middleware.call('pool.dataset.register_attachment_delegate', AFPFSAttachmentDelegate(middleware))
     middleware.register_hook('pool.post_import_pool', pool_post_import, sync=True)

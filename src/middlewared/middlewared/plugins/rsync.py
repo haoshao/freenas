@@ -26,6 +26,7 @@
 
 import asyncio
 import asyncssh
+import contextlib
 import glob
 import os
 import re
@@ -41,6 +42,9 @@ from middlewared.service import (
 from middlewared.utils import run_command_with_user_context
 
 
+RSYNC_PATH_LIMIT = 1023
+
+
 class RsyncdService(SystemServiceService):
 
     class Config:
@@ -51,7 +55,7 @@ class RsyncdService(SystemServiceService):
     @accepts(Dict(
         'rsyncd_update',
         Int('port', validators=[Range(min=1, max=65535)]),
-        Str('auxiliary'),
+        Str('auxiliary', max_length=None),
         update=True
     ))
     async def do_update(self, data):
@@ -93,8 +97,8 @@ class RsyncModService(CRUDService):
         for entity in ('user', 'group'):
             value = data.get(entity)
             if value not in map(
-                    lambda e: e[entity if entity == 'group' else 'username'],
-                    await self.middleware.call(f'{entity}.query')
+                lambda e: e[entity if entity == 'group' else 'username'],
+                await self.middleware.call(f'{entity}.query')
             ):
                 verrors.add(
                     f'{schema_name}.{entity}',
@@ -113,21 +117,24 @@ class RsyncModService(CRUDService):
         'rsyncmod_create',
         Str('name', validators=[Match(r'[^/\]]')]),
         Str('comment'),
-        Str('path', required=True),
+        Str('path', required=True, max_length=RSYNC_PATH_LIMIT),
         Str('mode', enum=['RO', 'RW', 'WO']),
         Int('maxconn'),
         Str('user', default='nobody'),
         Str('group', default='nobody'),
         List('hostsallow', items=[Str('hostsallow')], default=[]),
         List('hostsdeny', items=[Str('hostdeny')], default=[]),
-        Str('auxiliary'),
+        Str('auxiliary', max_length=None),
         register=True,
     ))
     async def do_create(self, data):
         """
         Create a Rsyncmod module.
 
-        `path` represents the path to pool/dataset.
+        `path` represents the path to a dataset. Path length is limited to 1023 characters maximum as per the limit
+        enforced by FreeBSD. It is possible that we reach this max length recursively while transferring data. In that
+        case, the user must ensure the maximum path will not be too long or modify the recursed path to shorter
+        than the limit.
 
         `maxconn` is an integer value representing the maximum number of simultaneous connections. Zero represents
         unlimited.
@@ -211,10 +218,10 @@ class RsyncTaskService(CRUDService):
             verrors.add(f'{schema}.user', 'User names cannot have spaces')
             raise verrors
 
-        user = await self.middleware.call(
-            'notifier.get_user_object',
-            username
-        )
+        user = None
+        with contextlib.suppress(KeyError):
+            user = await self.middleware.call('dscache.get_uncached_user', username)
+
         if not user:
             verrors.add(f'{schema}.user', f'Provided user "{username}" does not exist')
             raise verrors
@@ -245,8 +252,8 @@ class RsyncTaskService(CRUDService):
             if not remote_path:
                 verrors.add(f'{schema}.remotepath', 'This field is required')
 
-            search = os.path.join(user.pw_dir, '.ssh', 'id_[edr]*')
-            exclude_from_search = os.path.join(user.pw_dir, '.ssh', 'id_[edr]*pub')
+            search = os.path.join(user['pw_dir'], '.ssh', 'id_[edr]*')
+            exclude_from_search = os.path.join(user['pw_dir'], '.ssh', 'id_[edr]*pub')
             key_files = set(glob.glob(search)) - set(glob.glob(exclude_from_search))
             if not key_files:
                 verrors.add(
@@ -357,7 +364,7 @@ class RsyncTaskService(CRUDService):
 
     @accepts(Dict(
         'rsync_task_create',
-        Str('path', required=True),
+        Str('path', required=True, max_length=RSYNC_PATH_LIMIT),
         Str('user', required=True),
         Str('remotehost'),
         Int('remoteport'),
@@ -388,7 +395,7 @@ class RsyncTaskService(CRUDService):
         """
         Create a Rsync Task.
 
-        `path` represents the path to pool/dataset.
+        See the comment in Rsyncmod about `path` length limits.
 
         `remotehost` is ip address or hostname of the remote system. If username differs on the remote host,
         "username@remote_host" format should be used.
@@ -538,7 +545,7 @@ class RsyncTaskService(CRUDService):
         else:
             line += [
                 '-e',
-                f'ssh -p {rsync["remoteport"]} -o BatchMode=yes -o StrictHostKeyChecking=yes'
+                f'"ssh -p {rsync["remoteport"]} -o BatchMode=yes -o StrictHostKeyChecking=yes"'
             ]
             path_args = [path, f'{remote}:"{shlex.quote(rsync["remotepath"])}"']
             if rsync['direction'] != 'PUSH':
@@ -566,7 +573,15 @@ class RsyncTaskService(CRUDService):
             commandline, rsync['user'], lambda v: job.logs_fd.write(v)
         )
 
+        for klass in ('RsyncSuccess', 'RsyncFailed') if not rsync['quiet'] else ():
+            self.middleware.call_sync('alert.oneshot_delete', klass, rsync['id'])
+
         if cp.returncode != 0:
+            if not rsync['quiet']:
+                self.middleware.call_sync('alert.oneshot_create', 'RsyncFailed', rsync)
+
             raise CallError(
                 f'rsync command returned {cp.returncode}. Check logs for further information.'
             )
+        elif not rsync['quiet']:
+            self.middleware.call_sync('alert.oneshot_create', 'RsyncSuccess', rsync)

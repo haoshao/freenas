@@ -150,15 +150,15 @@ class SupportService(ConfigService):
 
     @accepts(Dict(
         'new_ticket',
-        Str('title', required=True),
-        Str('body', required=True),
+        Str('title', required=True, max_length=None),
+        Str('body', required=True, max_length=None),
         Str('category', required=True),
         Bool('attach_debug', default=False),
         Str('username', private=True),
         Str('password', private=True),
         Str('type', enum=['BUG', 'FEATURE']),
         Str('criticality'),
-        Str('environment'),
+        Str('environment', max_length=None),
         Str('phone'),
         Str('name'),
         Str('email'),
@@ -237,7 +237,7 @@ class SupportService(ConfigService):
             job.set_progress(60, 'Generating debug file')
 
             debug_job = await self.middleware.call(
-                'system.debug_download', pipes=Pipes(output=self.middleware.pipe()),
+                'system.debug', pipes=Pipes(output=self.middleware.pipe()),
             )
 
             not_freenas = not (await self.middleware.call('system.is_freenas'))
@@ -294,7 +294,7 @@ class SupportService(ConfigService):
     @accepts(Dict(
         'attach_ticket',
         Int('ticket', required=True),
-        Str('filename', required=True),
+        Str('filename', required=True, max_length=None),
         Str('username'),
         Str('password'),
     ))

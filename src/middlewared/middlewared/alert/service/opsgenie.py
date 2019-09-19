@@ -10,18 +10,20 @@ class OpsGenieAlertService(ProThreadedAlertService):
 
     schema = Dict(
         "opsgenie_attributes",
-        Str("cluster_name"),
-        Str("api_key"),
+        Str("cluster_name", default=""),
+        Str("api_key", required=True, empty=False),
+        Str("api_url", default=""),
+        strict=True,
     )
 
     def create_alert(self, alert):
         r = requests.post(
-            "https://api.opsgenie.com/v2/alerts",
+            (self.attributes.get("api_url") or "https://api.opsgenie.com") + "/v2/alerts",
             headers={"Authorization": f"GenieKey {self.attributes['api_key']}",
                      "Content-type": "application/json"},
             data=json.dumps({
                 "message": ellipsis(alert.formatted, 130),
-                "alias": self._alert_id(alert),
+                "alias": alert.uuid,
                 "description": ellipsis(alert.formatted, 15000),
             }),
             timeout=15,
@@ -30,7 +32,7 @@ class OpsGenieAlertService(ProThreadedAlertService):
 
     def delete_alert(self, alert):
         r = requests.delete(
-            "https://api.opsgenie.com/v2/alerts/" + self._alert_id(alert),
+            (self.attributes.get("api_url") or "https://api.opsgenie.com") + "/v2/alerts/" + alert.uuid,
             params={"identifierType": "alias"},
             headers={"Authorization": f"GenieKey {self.attributes['api_key']}"},
             timeout=15,

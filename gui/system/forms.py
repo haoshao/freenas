@@ -58,11 +58,10 @@ from freenasUI import choices
 from freenasUI.account.models import bsdGroups, bsdUsers
 from freenasUI.common import humanize_number_si, humanize_size, humansize_to_bytes
 from freenasUI.common.forms import Form, ModelForm
-from freenasUI.common.freenasldap import FreeNAS_LDAP
 from freenasUI.directoryservice.forms import (ActiveDirectoryForm, LDAPForm,
                                               NISForm)
 from freenasUI.directoryservice.models import LDAP, NIS, ActiveDirectory
-from freenasUI.freeadmin.forms import SizeField
+from freenasUI.freeadmin.apppool import appPool
 from freenasUI.freeadmin.utils import key_order
 from freenasUI.freeadmin.views import JsonResp
 from freenasUI.middleware.client import (ClientException, ValidationErrors,
@@ -81,7 +80,6 @@ from freenasUI.storage.forms import VolumeAutoImportForm, VolumeMixin
 from freenasUI.storage.models import Disk, Scrub, Volume
 from freenasUI.system import models
 from freenasUI.tasks.models import SMARTTest
-from ldap import LDAPError
 
 log = logging.getLogger('system.forms')
 WIZARD_PROGRESSFILE = '/tmp/.initialwizard_progress'
@@ -386,7 +384,8 @@ class InitialWizard(CommonWizard):
                     f.write(pickle.dumps(progress))
 
                 with client as c:
-                    lock = c.call("alert.block_source", "VolumeStatus")
+                    # Creating large pool can take a very long time
+                    lock = c.call("alert.block_source", "VolumeStatus", 14400)
                     try:
                         if volume_import:
                             volume_name, guid = cleaned_data.get(
@@ -467,7 +466,6 @@ class InitialWizard(CommonWizard):
                 share_userpw = share.get('share_userpw')
                 share_group = share.get('share_group')
                 share_groupcreate = share.get('share_groupcreate')
-                share_mode = share.get('share_mode')
 
                 dataset_name = '%s/%s' % (volume_name, share_name)
                 if share_purpose != 'iscsitarget':
@@ -476,18 +474,12 @@ class InitialWizard(CommonWizard):
                             c.call('pool.dataset.create', {
                                 'name': dataset_name,
                                 'type': 'FILESYSTEM',
+                                'share_type': 'SMB' if share_purpose == 'cifs' else 'GENERIC',
                             })
                     except ClientException as e:
                         raise MiddlewareError(
                             _('Failed to create ZFS dataset: %s.') % e
                         )
-
-                    if share_purpose == 'afp':
-                        _n.change_dataset_share_type(dataset_name, 'mac')
-                    elif share_purpose == 'cifs':
-                        _n.change_dataset_share_type(dataset_name, 'windows')
-                    elif share_purpose == 'nfs':
-                        _n.change_dataset_share_type(dataset_name, 'unix')
 
                     qs = bsdGroups.objects.filter(bsdgrp_group=share_group)
                     if not qs.exists():
@@ -813,30 +805,25 @@ class InitialWizard(CommonWizard):
             if not share:
                 continue
 
+            kwargs = {}
             share_name = share.get('share_name')
             share_purpose = share.get('share_purpose')
-            share_user = share.get('share_user')
-            share_group = share.get('share_group')
-            share_mode = share.get('share_mode')
+            kwargs['user'] = share.get('share_user')
+            kwargs['group'] = share.get('share_group')
+            kwargs['mode'] = share.get('share_mode')
 
             if share_purpose == 'iscsitarget':
                 continue
 
-            if share_purpose == 'afp':
-                share_acl = 'mac'
-            elif share_purpose == 'cifs':
-                share_acl = 'windows'
+            if share_purpose == 'cifs':
+                kwargs['mode'] = None
             else:
-                share_acl = 'unix'
+                kwargs['acl'] = []
 
-            _n.mp_change_permission(
-                path='/mnt/%s/%s' % (volume_name, share_name),
-                user=share_user,
-                group=share_group,
-                mode=share_mode,
-                recursive=False,
-                acl=share_acl,
-            )
+            with client as c:
+                dataset = c.call('pool.dataset.query', [['mountpoint', '=', f'/mnt/{volume_name}/{share_name}']], {'get': True})
+
+                c.call('pool.dataset.permission', dataset['id'], kwargs)
 
         curstep += 1
         progress['step'] = curstep
@@ -1008,6 +995,7 @@ class SettingsForm(MiddlewareModelForm, ModelForm):
             'stg_guiport': forms.widgets.TextInput(),
             'stg_guihttpsport': forms.widgets.TextInput(),
             'stg_crash_reporting': forms.widgets.CheckboxInput(),
+            'stg_usage_collection': forms.widgets.CheckboxInput(),
         }
 
     def __init__(self, *args, **kwargs):
@@ -1045,6 +1033,7 @@ class SettingsForm(MiddlewareModelForm, ModelForm):
                 update.pop(key, None)
 
         update['crash_reporting'] = update['crash_reporting'] == 'True'
+        update['usage_collection'] = update['usage_collection'] == 'True'
 
         return update
 
@@ -1139,7 +1128,7 @@ class AdvancedForm(MiddlewareModelForm, ModelForm):
     def __init__(self, *args, **kwargs):
         super(AdvancedForm, self).__init__(*args, **kwargs)
         self.fields['adv_motd'].strip = False
-        self.original_instance = self.instance.__dict__
+        self.original_instance = self.instance.__dict__.copy()
 
         self.fields['adv_serialport'].choices = list(choices.SERIAL_CHOICES())
 
@@ -1171,6 +1160,9 @@ class AdvancedForm(MiddlewareModelForm, ModelForm):
             events.append("_msg_start()")
         else:
             events.append("_msg_stop()")
+
+        if self.original_instance['adv_legacy_ui'] != self.instance.adv_legacy_ui:
+            events.append(f'evilrestartHttpd(\'http://{request.META["HTTP_HOST"]}\')')
 
         if self.original_instance['adv_advancedmode'] != self.instance.adv_advancedmode:
             # Invalidate cache
@@ -1317,6 +1309,11 @@ class ConfigSaveForm(Form):
         initial=False,
         required=False,
     )
+    pool_keys = forms.BooleanField(
+        label=_('Export encrypted pools geli keys'),
+        initial=False,
+        required=False,
+    )
 
 
 """
@@ -1386,6 +1383,11 @@ class TunableForm(MiddlewareModelForm, ModelForm):
 
 
 class AlertClassesWidget(forms.Widget):
+    def __init__(self, prefix=''):
+        self.prefix = prefix
+
+        super().__init__()
+
     def render(self, name, value, attrs=None, renderer=None):
         value = value or {}
 
@@ -1402,7 +1404,7 @@ class AlertClassesWidget(forms.Widget):
             html.append(f'<td>{source["title"]}</td>')
 
             html.append('<td>')
-            html.append(f'<select dojoType="dijit.form.Select" id="id_{name}_{source["name"]}" '
+            html.append(f'<select dojoType="dijit.form.Select" id="id_{self.prefix}{name}_{source["name"]}" '
                         f'name="{name}[{source["name"]}]">')
             options = [(policy, policy.title()) for policy in policies]
             for k, v in options:
@@ -1438,7 +1440,7 @@ class AlertClassesForm(MiddlewareModelForm, ModelForm):
     is_singletone = True
 
     classes = forms.CharField(
-        widget=AlertClassesWidget(),
+        widget=AlertClassesWidget(prefix='alertclasses_'),
     )
 
     class Meta:
@@ -1488,8 +1490,7 @@ class AlertServiceForm(MiddlewareModelForm, ModelForm):
     # Influxdb
     host = forms.CharField(
         max_length=255,
-        label=_("Host"),
-        help_text=_("Influxdb Host"),
+        label=_("Hostname"),
         required=False,
     )
     database = forms.CharField(
@@ -1516,12 +1517,6 @@ class AlertServiceForm(MiddlewareModelForm, ModelForm):
         max_length=255,
         label=_("Icon URL"),
         help_text=_("URL of a custom image for notification icons. This overrides the default if set in the Incoming Webhook settings."),
-        required=False,
-    )
-    detailed = forms.BooleanField(
-        label=_("Detailed"),
-        help_text=_("Enable pretty Slack notifications"),
-        initial=False,
         required=False,
     )
 
@@ -1581,6 +1576,12 @@ class AlertServiceForm(MiddlewareModelForm, ModelForm):
         help_text=_("API Key"),
         required=False,
     )
+    api_url = forms.CharField(
+        max_length=255,
+        label=_("API URL"),
+        help_text=_("API URL (leave empty for default)"),
+        required=False,
+    )
 
     # AWS SNS
     region = forms.CharField(
@@ -1623,6 +1624,61 @@ class AlertServiceForm(MiddlewareModelForm, ModelForm):
         required=False,
     )
 
+    # SNMPTrap
+    port = forms.IntegerField(
+        label=_('Port'),
+        required=False,
+        initial=162,
+    )
+    v3 = forms.BooleanField(
+        label=_('SNMPv3 Security Model'),
+        required=False,
+    )
+    community = forms.CharField(
+        label=_('SNMP Community'),
+        required=False,
+        initial='public',
+    )
+    v3_username = forms.CharField(
+        label=_('Username'),
+        required=False,
+    )
+    v3_authkey = forms.CharField(
+        label=_('Secret authentication key'),
+        required=False,
+    )
+    v3_privkey = forms.CharField(
+        label=_('Secret encryption key'),
+        required=False,
+    )
+    v3_authprotocol = forms.ChoiceField(
+        label=_('Authentication protocol'),
+        required=False,
+        choices=[
+            ('', 'Disabled'),
+            ('MD5', 'MD5'),
+            ('SHA', 'SHA'),
+            ('128SHA224', 'HMAC128SHA224'),
+            ('192SHA256', 'HMAC192SHA256'),
+            ('256SHA384', 'HMAC256SHA384'),
+            ('384SHA512', 'HMAC384SHA512'),
+        ],
+    )
+    v3_privprotocol = forms.ChoiceField(
+        label=_('Encryption protocol'),
+        required=False,
+        choices=[
+            ('', 'Disabled'),
+            ('DES', 'DES'),
+            ('3DESEDE', '3DES-EDE'),
+            ('AESCFB128', 'CFB128-AES-128'),
+            ('AESCFB192', 'CFB128-AES-192'),
+            ('AESCFB256', 'CFB128-AES-256'),
+            ('AESBLUMENTHALCFB192', 'CFB128-AES-192 Blumenthal'),
+            ('AESBLUMENTHALCFB256', 'CFB128-AES-256 Blumenthal'),
+        ],
+    )
+
     level = forms.ChoiceField(
         choices=[
             ('INFO', 'Info'),
@@ -1647,10 +1703,11 @@ class AlertServiceForm(MiddlewareModelForm, ModelForm):
         'InfluxDB': ['host', 'username', 'password', 'database', 'series_name'],
         'Mattermost': ['cluster_name', 'url', 'username', 'password', 'team', 'channel'],
         'Mail': ['email'],
-        'OpsGenie': ['cluster_name', 'api_key'],
+        'OpsGenie': ['cluster_name', 'api_key', 'api_url'],
         'PagerDuty': ['service_key', 'client_name'],
-        'Slack': ['cluster_name', 'url', 'channel', 'username', 'icon_url', 'detailed'],
-        'SNMPTrap': [],
+        'Slack': ['cluster_name', 'url', 'channel', 'username', 'icon_url'],
+        'SNMPTrap': ['host', 'port', 'v3', 'community', 'v3_username', 'v3_authkey', 'v3_privkey', 'v3_authprotocol',
+                     'v3_privprotocol'],
         'VictorOps': ['api_key', 'routing_key'],
     }
 
@@ -1664,6 +1721,9 @@ class AlertServiceForm(MiddlewareModelForm, ModelForm):
             self.fields['type'].choices = [(t["name"], t["title"]) for t in c.call('alertservice.list_types')]
         self.fields['type'].widget.attrs['onChange'] = (
             "alertServiceTypeToggle();"
+        )
+        self.fields['v3'].widget.attrs['onChange'] = (
+            "snmpv3toggle();"
         )
         key_order(self, len(self.fields) - 2, 'level', instance=True)
         key_order(self, len(self.fields) - 1, 'enabled', instance=True)
@@ -1690,13 +1750,17 @@ class AlertServiceForm(MiddlewareModelForm, ModelForm):
 
     def middleware_clean(self, data):
         data["attributes"] = {k: data[k] for k in self.types_fields[data["type"]]}
+        if data["type"] == "SNMPTrap":
+            for k in ["community", "v3_username", "v3_authkey", "v3_privkey", "v3_authprotocol", "v3_privprotocol"]:
+                if not data["attributes"][k]:
+                    data["attributes"][k] = None
         for k in sum(self.types_fields.values(), []):
             data.pop(k, None)
         return data
 
-    def delete(self):
+    def delete(self, *args, **kwargs):
         with client as c:
-            c.call("alert_service.delete", self.instance.id)
+            c.call("alertservice.delete", self.instance.id)
 
 
 class SystemDatasetForm(MiddlewareModelForm, ModelForm):
@@ -1724,9 +1788,15 @@ class SystemDatasetForm(MiddlewareModelForm, ModelForm):
                 pool_choices.append((v.vol_name, v.vol_name))
 
         self.fields['sys_pool'].choices = pool_choices
-        self.fields['sys_pool'].widget.attrs['onChange'] = (
-            "systemDatasetMigration();"
-        )
+        with client as c:
+            if not c.call('system.is_freenas') and c.call('notifier.failover_licensed'):
+                self.fields['sys_pool'].widget.attrs['onChange'] = (
+                    "systemDatasetMigration_TN();"
+                )
+            else:
+                self.fields['sys_pool'].widget.attrs['onChange'] = (
+                    "systemDatasetMigration();"
+                )
 
     def middleware_clean(self, update):
         update['syslog'] = update.pop('syslog_usedataset')
@@ -1898,29 +1968,21 @@ class InitialWizardDSForm(Form):
                 else:
                     cdata.pop('ds_type', None)
             else:
-                try:
-                    FreeNAS_LDAP.validate_credentials(hostname, binddn=binddn, bindpw=bindpw)
-                except LDAPError as e:
-                    # LDAPError is dumb, it returns a list with one element for goodness knows what reason
-                    if not hasattr(e, '__iter__'):
-                        raise forms.ValidationError("{0}".format(e))
-                    e = e[0]
-                    error = []
-                    desc = e.get('desc')
-                    info = e.get('info')
-                    if desc:
-                        error.append(desc)
-                    if info:
-                        error.append(info)
-
-                    if error:
-                        error = ', '.join(error)
-                    else:
-                        error = str(e)
-
-                    raise forms.ValidationError("{0}".format(error))
-                except Exception as e:
-                    raise forms.ValidationError("{0}".format(str(e)))
+                ldap_config = {
+                    'hostname': hostname.split(),
+                    'binddn': bindname,
+                    'bindpw': bindpw,
+                    'anonbind': False,
+                    'ssl': 'off',
+                    'dns_timeout': 10,
+                    'timeout': 10,
+                    'kerberos_principal': None,
+                }
+                with client as c:
+                    try:
+                        c.call('ldap.validate_credentials', ldap_config)
+                    except Exception as e:
+                        raise forms.ValidationError("{0}".format(str(e)))
 
         elif cdata.get('ds_type') == 'nis':
             values = []
@@ -3716,6 +3778,13 @@ class SSHKeyPairKeychainCredentialForm(MiddlewareModelForm, ModelForm):
             "attributes": attributes,
         }
 
+    def delete(self, request=None, events=None, **kwargs):
+        with client as c:
+            c.call(f"{self.middleware_plugin}.delete", self.instance.id, {"cascade": True})
+
+        fname = str(type(self).__name__)
+        appPool.hook_form_delete(fname, self, request, events)
+
     name = forms.CharField(
         label=_("Name"),
     )
@@ -3797,6 +3866,13 @@ class SSHCredentialsKeychainCredentialForm(MiddlewareModelForm, ModelForm):
                     return self.instance
 
         return super().save()
+
+    def delete(self, request=None, events=None, **kwargs):
+        with client as c:
+            c.call(f"{self.middleware_plugin}.delete", self.instance.id, {"cascade": True})
+
+        fname = str(type(self).__name__)
+        appPool.hook_form_delete(fname, self, request, events)
 
     name = forms.CharField(
         label=_("Name"),

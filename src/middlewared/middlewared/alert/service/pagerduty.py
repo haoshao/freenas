@@ -10,8 +10,9 @@ class PagerDutyAlertService(ProThreadedAlertService):
 
     schema = Dict(
         "pagerduty_attributes",
-        Str("service_key"),
-        Str("client_name"),
+        Str("service_key", required=True, empty=False),
+        Str("client_name", required=True, empty=False),
+        strict=True,
     )
 
     def create_alert(self, alert):
@@ -22,7 +23,7 @@ class PagerDutyAlertService(ProThreadedAlertService):
                 "service_key": self.attributes["service_key"],
                 "event_type": "trigger",
                 "description": ellipsis(alert.formatted, 1024),
-                "incident_key": self._alert_id(alert),
+                "incident_key": alert.uuid,
                 "client": self.attributes["client_name"],
             }),
             timeout=15,
@@ -37,7 +38,7 @@ class PagerDutyAlertService(ProThreadedAlertService):
                 "service_key": self.attributes["service_key"],
                 "event_type": "resolve",
                 "description": "",
-                "incident_key": self._alert_id(alert),
+                "incident_key": alert.uuid,
                 "client": self.attributes["client_name"],
             }),
             timeout=15,

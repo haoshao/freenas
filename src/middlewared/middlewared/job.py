@@ -10,7 +10,7 @@ import time
 import traceback
 import threading
 
-from middlewared.service_exception import CallError, ValidationError, ValidationErrors
+from middlewared.service_exception import CallError, ValidationError, ValidationErrors, adapt_exception
 from middlewared.pipe import Pipes
 
 logger = logging.getLogger(__name__)
@@ -133,9 +133,8 @@ class JobsQueue(object):
         # waiting for the same lock
         self.queue_event.set()
 
-    async def __next__(self):
+    async def next(self):
         """
-        This is a blocking method.
         Returns when there is a new job ready to run.
         """
         while True:
@@ -167,7 +166,7 @@ class JobsQueue(object):
 
     async def run(self):
         while True:
-            job = await self.__next__()
+            job = await self.next()
             asyncio.ensure_future(job.run(self))
 
 
@@ -237,6 +236,7 @@ class Job(object):
             'description': None,
             'extra': None,
         }
+        self.internal_data = {}
         self.time_started = datetime.now()
         self.time_finished = None
         self.loop = asyncio.get_event_loop()
@@ -339,12 +339,19 @@ class Job(object):
             logs_dir = os.path.join("/tmp/middlewared/jobs")
             os.makedirs(logs_dir, exist_ok=True)
             self.logs_path = os.path.join(logs_dir, f"{self.id}.log")
-            self.logs_fd = open(self.logs_path, "wb")
+            self.logs_fd = open(self.logs_path, "wb", buffering=0)
 
         self.set_state('RUNNING')
         try:
             self.future = asyncio.ensure_future(self.__run_body())
-            await self.future
+            try:
+                await self.future
+            except Exception as e:
+                handled = adapt_exception(e)
+                if handled is not None:
+                    raise handled
+                else:
+                    raise
         except asyncio.CancelledError:
             self.set_state('ABORTED')
         except Exception:
@@ -391,16 +398,16 @@ class Job(object):
                 lines = 0
                 with open(self.logs_path, "r", encoding="utf-8", errors="ignore") as f:
                     for line in f:
-                        if len(head) < 5:
+                        if len(head) < 10:
                             head.append(line)
-
-                        tail.append(line)
-                        tail = tail[-5:]
+                        else:
+                            tail.append(line)
+                            tail = tail[-10:]
 
                         lines += 1
 
-                if lines > 10:
-                    excerpt = "%s... %d more lines ...\n%s" % ("".join(head), lines - 10, "".join(tail))
+                if lines > 20:
+                    excerpt = "%s... %d more lines ...\n%s" % ("".join(head), lines - 20, "".join(tail))
                 else:
                     excerpt = "".join(head + tail)
 

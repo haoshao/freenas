@@ -37,14 +37,14 @@ def build_share(config, share):
             result.append("-quiet")
 
         if share["mapall_user"]:
-            s = f'-mapall="{share["mapall_user"]}"'
+            s = '-mapall="' + share["mapall_user"].replace('\\', '\\\\') + '"'
             if share["mapall_group"]:
-                s += f':"{share["mapall_group"]}"'
+                s += ':"' + share["mapall_group"].replace('\\', '\\\\') + '"'
             result.append(s)
         elif share["maproot_user"]:
-            s = f'-maproot="{share["maproot_user"]}"'
+            s = '-maproot="' + share["maproot_user"].replace('\\', '\\\\') + '"'
             if share["maproot_group"]:
-                s += f':"{share["maproot_group"]}"'
+                s += ':"' + share["maproot_group"].replace('\\', '\\\\') + '"'
             result.append(s)
 
         if config["v4"] and share["security"]:
@@ -75,7 +75,7 @@ def build_share_targets(share):
 async def render(service, middleware):
     config = await middleware.call("nfs.config")
 
-    shares = await middleware.call("sharing.nfs.query")
+    shares = await middleware.call("sharing.nfs.query", [["enabled", "=", True]])
 
     kerberos_keytabs = await middleware.call("datastore.query", "directoryservice.kerberoskeytab")
 

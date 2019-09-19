@@ -978,7 +978,6 @@ DATASET_COMMON_MAPPING = [
     ('dataset_comments', 'comments', None),
     ('dataset_sync', 'sync', str.upper),
     ('dataset_compression', 'compression', str.upper),
-    ('dataset_share_type', 'share_type', str.upper),
     ('dataset_atime', 'atime', str.upper),
     ('dataset_refquota', 'refquota', lambda v: v or None),
     ('refquota_warning', 'refquota_warning', None),
@@ -991,7 +990,13 @@ DATASET_COMMON_MAPPING = [
     ('dataset_dedup', 'deduplication', str.upper),
     ('dataset_readonly', 'readonly', str.upper),
     ('dataset_exec', 'exec', str.upper),
-    ('dataset_recordsize', 'recordsize', str.upper),
+    (
+        'dataset_recordsize',
+        'recordsize',
+        lambda v: '1024K' if v == '1M' else (v.upper() if v else None),
+    ),
+    ('dataset_aclmode', 'aclmode', str.upper),
+    ('dataset_share_type', 'share_type', str.upper),
 ]
 
 
@@ -1010,11 +1015,6 @@ class ZFSDatasetCommonForm(Form):
         widget=forms.Select(attrs=attrs_dict),
         label=_('Compression level'),
         initial=choices.ZFS_CompressionChoices[0][0])
-    dataset_share_type = forms.ChoiceField(
-        choices=choices.SHARE_TYPE_CHOICES,
-        widget=forms.Select(attrs=attrs_dict),
-        label=_('Share type'),
-        initial=choices.SHARE_TYPE_CHOICES[0][0])
     dataset_atime = forms.ChoiceField(
         choices=choices.ZFS_AtimeChoices,
         widget=forms.RadioSelect(attrs=attrs_dict),
@@ -1076,6 +1076,11 @@ class ZFSDatasetCommonForm(Form):
         choices=choices.ZFS_ExecChoices,
         initial=choices.ZFS_ExecChoices[0][0],
     )
+    dataset_aclmode = forms.ChoiceField(
+        label=_('Aclmode'),
+        choices=choices.ZFS_AclmodeChoices,
+        initial=choices.ZFS_AclmodeChoices[0][0],
+    )
     dataset_recordsize = forms.ChoiceField(
         label=_('Record Size'),
         choices=choices.ZFS_RECORDSIZE,
@@ -1102,6 +1107,7 @@ class ZFSDatasetCommonForm(Form):
         'dataset_reservation',
         'dataset_recordsize',
         'dataset_exec',
+        'dataset_aclmode'
     )
 
     def __init__(self, *args, fs=None, **kwargs):
@@ -1136,6 +1142,10 @@ class ZFSDatasetCommonForm(Form):
             self.fields['dataset_recordsize'].choices = _inherit_choices(
                 choices.ZFS_RECORDSIZE,
                 self.parentdata['recordsize']['value']
+            )
+            self.fields['dataset_aclmode'].choices = _inherit_choices(
+                choices.ZFS_AclmodeChoices,
+                self.parentdata['aclmode']['value'].lower()
             )
 
         if not dedup_enabled():
@@ -1212,6 +1222,11 @@ class ZFSDatasetCreateForm(ZFSDatasetCommonForm):
         initial=choices.CASE_SENSITIVITY_CHOICES[0][0],
         widget=forms.Select(attrs=attrs_dict),
         label=_('Case Sensitivity'))
+    dataset_share_type = forms.ChoiceField(
+        choices=choices.SHARE_TYPE_CHOICES,
+        widget=forms.Select(attrs=attrs_dict),
+        label=_('Share type'),
+        initial=choices.SHARE_TYPE_CHOICES[0][0])
 
     field_order = ['dataset_name']
 
@@ -1323,12 +1338,17 @@ class ZFSDatasetEditForm(ZFSDatasetCommonForm):
         else:
             data['dataset_exec'] = 'off'
 
+        if zdata['aclmode']['source'] in ['DEFAULT', 'INHERITED']:
+            data['dataset_aclmode'] = 'inherit'
+        elif zdata['aclmode']['value'] in ('PASSTHROUGH', 'RESTRICTED'):
+            data['dataset_aclmode'] = zdata['aclmode']['value'].lower()
+        else:
+            data['dataset_aclmode'] = 'passthrough'
+
         if zdata['recordsize']['source'] in ['DEFAULT', 'INHERITED']:
             data['dataset_recordsize'] = 'inherit'
         else:
             data['dataset_recordsize'] = zdata['recordsize']['value']
-
-        data['dataset_share_type'] = zdata['share_type'].lower()
 
         for k in ['quota_warning', 'quota_critical', 'refquota_warning', 'refquota_critical']:
             if k in zdata and zdata[k]['source'] == 'LOCAL':
@@ -1342,6 +1362,9 @@ class ZFSDatasetEditForm(ZFSDatasetCommonForm):
     def save(self):
         data = {}
         for old, new, save in DATASET_COMMON_MAPPING:
+            if old == 'dataset_share_type':
+                continue
+
             v = (save or (lambda x: x))(self.cleaned_data[old])
             data[new] = v
 
@@ -1597,34 +1620,70 @@ class MountPointAccessForm(Form):
         label=_('Apply Owner (user)'),
         initial=True,
         required=False,
+        help_text=_(
+            "Recursively change the user ownership of the ZFS dataset contents. "
+        )
     )
     mp_user = UserField(label=_('Owner (user)'))
     mp_group_en = forms.BooleanField(
         label=_('Apply Owner (group)'),
         initial=True,
         required=False,
+        help_text=_(
+            "Recursively change the group ownership of the ZFS dataset contents. "
+        )
     )
     mp_group = GroupField(label=_('Owner (group)'))
     mp_mode_en = forms.BooleanField(
         label=_('Apply Mode'),
         initial=True,
         required=False,
+        help_text=_(
+            "Recursively apply the selected mode to the contents of "
+            "the referenced ZFS dataset."
+        )
     )
-    mp_mode = UnixPermissionField(label=_('Mode'), required=False)
+    mp_mode = UnixPermissionField(
+        label=_('Mode'),
+        required=False,
+        help_text=_(
+            "Graphical representation of the POSIX mode (permissions) "
+            "at the root of the referenced dataset. This mode may not "
+            "be representative of the contents of the dataset. This box "
+            "is disabled when an Access Control List (ACL) is present on "
+            "the dataset. In this situation, the ACL must be removed if "
+            "a new posix mode is to be applied on the dataset. By default, "
+            "changes to the POSIX mode will recursively apply to the contents "
+            "of the dataset, but not extend to child datasets."
+        )
+    )
     mp_acl = forms.ChoiceField(
-        label=_('Permission Type'),
+        label=_('Modify Access Control List'),
         choices=(
-            ('unix', 'Unix'),
-            ('mac', 'Mac'),
-            ('windows', 'Windows'),
+            ('noaction', 'No Action'),
+            ('remove', 'Remove'),
+            ('applydefault', 'Apply Default')
         ),
-        initial='unix',
+        initial='noaction',
         widget=forms.widgets.RadioSelect(),
+        help_text=_(
+            "Modify dataset Access control list (ACL). SMB shares are the "
+            "typical use case where setting an ACL may be desireable. The 'Mode' "
+            "form field is disabled when an ACL is present on the dataset. The "
+            "'Remove' option will remove the ACL from the dataset, and enable "
+            "'Mode'. 'Apply Default' sets a default ACL granting Owner 'Full "
+            "Control' and Group 'Full Control'."
+        )
     )
-    mp_recursive = forms.BooleanField(
+    mp_traverse = forms.BooleanField(
         initial=False,
         required=False,
-        label=_('Set permission recursively')
+        label=_('Apply to child datasets'),
+        help_text=_(
+            "Apply dataset permissions changes to child datasets. "
+            "Unset for changes to be restricted to the contents of the "
+            "referenced dataset."
+        )
     )
 
     def __init__(self, *args, **kwargs):
@@ -1635,35 +1694,57 @@ class MountPointAccessForm(Form):
             with client as c:
                 stat = c.call('filesystem.stat', path)
 
-                self.fields['mp_acl'].initial = stat['acl']
-
-                if stat['acl'] == 'windows':
+                """
+                Disable the mode editor if the path has an extended ACL.
+                """
+                if stat['acl']:
                     self.fields['mp_mode'].widget.attrs['disabled'] = 'disabled'
+                    self.fields['mp_mode_en'].widget.attrs['disabled'] = 'disabled'
 
                 self.fields['mp_mode'].initial = "%.3o" % stat['mode']
                 self.fields['mp_user'].initial = stat['user']
                 self.fields['mp_group'].initial = stat['group']
-
         self.fields['mp_acl'].widget.attrs['onChange'] = "mpAclChange(this);"
 
     def commit(self, path):
 
         with client as c:
             dataset = c.call('pool.dataset.query', [['mountpoint', '=', path.rstrip('/')]], {'get': True})
+            acl_is_present = (c.call('filesystem.stat', path))['acl']
 
         kwargs = {}
-
-        if self.cleaned_data.get('mp_group_en'):
-            kwargs['group'] = self.cleaned_data['mp_group']
 
         if self.cleaned_data.get('mp_user_en'):
             kwargs['user'] = self.cleaned_data['mp_user']
 
-        kwargs['acl'] = self.cleaned_data['mp_acl'].upper()
-        if kwargs['acl'] != 'WINDOWS' and self.cleaned_data.get('mp_mode_en'):
+        if self.cleaned_data.get('mp_group_en'):
+            kwargs['group'] = str(self.cleaned_data['mp_group'])
+
+        if self.cleaned_data.get('mp_mode_en'):
             kwargs['mode'] = str(self.cleaned_data['mp_mode'])
 
-        kwargs['recursive'] = self.cleaned_data['mp_recursive']
+        action = self.cleaned_data['mp_acl']
+
+        kwargs['options'] = {
+            'traverse': self.cleaned_data['mp_traverse'],
+            'recursive': True,
+            'stripacl': True if action == 'remove' else False
+        }
+
+        if action == 'applydefault':
+            kwargs['mode'] = None
+        elif action == "noaction" and acl_is_present:
+            """
+            ACL exists and user has selected 'noaction'. Original
+            behavior was to perform an ACL reset in this situation.
+            New behavior is to only reset permissions if explictly
+            selected.
+            """
+            with client as c:
+                kwargs['acl'] = []
+                kwargs['mode'] = None
+        else:
+            kwargs['acl'] = []
 
         with client as c:
             try:
@@ -1682,7 +1763,7 @@ class MountPointAccessForm(Form):
                     else:
                         self._errors[field_name] += [error_message]
 
-                return False
+        return False
 
 
 class ResilverForm(MiddlewareModelForm, ModelForm):
@@ -1828,7 +1909,8 @@ class ManualSnapshotForm(Form):
         required=False,
         label=_('Recursive snapshot'))
 
-    ms_name = forms.CharField(label=_('Snapshot Name'))
+    ms_name = forms.CharField(label=_('Snapshot Name'), required=False)
+    ms_naming_schema = forms.ChoiceField(label=_('Snapshot Naming Schema'), required=False)
 
     vmwaresync = forms.BooleanField(
         required=False,
@@ -1842,12 +1924,21 @@ class ManualSnapshotForm(Form):
         self.fields['ms_name'].initial = datetime.today().strftime(
             'manual-%Y%m%d')
         with client as c:
+            self.fields['ms_naming_schema'].choices = [
+                ('', '---')
+            ] + [
+                (v, v)
+                for v in c.call('replication.list_naming_schemas')
+            ]
+
             if not c.call("vmware.dataset_has_vms", self._fs, True):
                 self.fields.pop('vmwaresync')
 
     def clean_ms_name(self):
         regex = re.compile('^[-a-zA-Z0-9_. ]+$')
         name = self.cleaned_data.get('ms_name')
+        if not name:
+            return name
         if regex.match(name) is None:
             raise forms.ValidationError(
                 _("Only [-a-zA-Z0-9_. ] permitted as snapshot name")
@@ -1860,14 +1951,28 @@ class ManualSnapshotForm(Form):
                 )
         return name
 
+    def clean(self):
+        cdata = self.cleaned_data
+
+        if cdata.get('ms_name') and cdata.get('ms_naming_schema'):
+            self._errors.setdefault('ms_naming_schema', self.error_class([]))
+            self._errors['ms_naming_schema'].append('You can\'t specify name and naming schema at the same time')
+        if not cdata.get('ms_name') and not cdata.get('ms_naming_schema'):
+            self._errors.setdefault('ms_name', self.error_class([]))
+            self._errors['ms_name'].append('You must specify either name or naming schema')
+
     def commit(self, fs):
         with client as c:
-            c.call("zfs.snapshot.create", {
+            data = {
                 "dataset": fs,
-                "name": str(self.cleaned_data['ms_name']),
                 "recursive": self.cleaned_data['ms_recursively'],
                 "vmware_sync": self.cleaned_data.get('vmwaresync', False),
-            })
+            }
+            if self.cleaned_data.get('ms_name'):
+                data['name'] = self.cleaned_data['ms_name']
+            if self.cleaned_data.get('ms_naming_schema'):
+                data['naming_schema'] = self.cleaned_data['ms_naming_schema']
+            c.call("zfs.snapshot.create", data)
 
 
 class CloneSnapshotForm(Form):
@@ -2072,6 +2177,7 @@ class ReplicationForm(MiddlewareModelForm, ModelForm):
     )
 
     class Meta:
+        exclude = ("repl_embed",)
         fields = "__all__"
         model = models.Replication
 
@@ -2343,8 +2449,8 @@ class ReplicationForm(MiddlewareModelForm, ModelForm):
             'dom': data.pop('schedule_daymonth'),
             'month': data.pop('schedule_month'),
             'dow': data.pop('schedule_dayweek'),
-            'begin': data.pop('schedule_begin') or '00:00',
-            'end': data.pop('schedule_end') or '23:45',
+            'begin': (data.pop('schedule_begin') or time(0, 0)).strftime('%H:%M'),
+            'end': (data.pop('schedule_end') or time(23, 45)).strftime('%H:%M'),
         }
         if not (data.pop("enable_schedule") and data["auto"]):
             data["schedule"] = None
@@ -2355,8 +2461,8 @@ class ReplicationForm(MiddlewareModelForm, ModelForm):
             'dom': data.pop('restrict_schedule_daymonth'),
             'month': data.pop('restrict_schedule_month'),
             'dow': data.pop('restrict_schedule_dayweek'),
-            'begin': data.pop('restrict_schedule_begin') or '00:00',
-            'end': data.pop('restrict_schedule_end') or '23:45',
+            'begin': (data.pop('restrict_schedule_begin') or time(0, 0)).strftime('%H:%M'),
+            'end': (data.pop('restrict_schedule_end') or time(23, 45)).strftime('%H:%M'),
         }
         if not (data.pop("enable_restrict_schedule")):
             data["restrict_schedule"] = None
@@ -2397,9 +2503,9 @@ class VolumeExport(Form):
 
     def __init__(self, *args, **kwargs):
         self.instance = kwargs.pop('instance', None)
-        services = kwargs.pop('services', {})
+        attachments = kwargs.pop('attachments', [])
         super(VolumeExport, self).__init__(*args, **kwargs)
-        if list(services.keys()):
+        if attachments:
             self.fields['cascade'] = forms.BooleanField(
                 initial=True,
                 required=False,

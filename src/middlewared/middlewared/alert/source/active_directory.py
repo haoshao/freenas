@@ -1,6 +1,6 @@
 from datetime import timedelta
 import logging
-from middlewared.alert.base import AlertClass, AlertCategory, Alert, AlertLevel, AlertSource
+from middlewared.alert.base import AlertClass, AlertCategory, Alert, AlertLevel, AlertSource, SimpleOneShotAlertClass
 from middlewared.alert.schedule import CrontabSchedule, IntervalSchedule
 
 log = logging.getLogger("activedirectory_check_alertmod")
@@ -9,19 +9,27 @@ log = logging.getLogger("activedirectory_check_alertmod")
 class ActiveDirectoryDomainBindAlertClass(AlertClass):
     category = AlertCategory.DIRECTORY_SERVICE
     level = AlertLevel.WARNING
-    title = "ActiveDirectory Bind Is Not Healthy"
+    title = "Active Directory Bind Is Not Healthy"
     text = "Attempt to connect to netlogon share failed with error: %(wberr)s."
 
 
 class ActiveDirectoryDomainHealthAlertClass(AlertClass):
     category = AlertCategory.DIRECTORY_SERVICE
     level = AlertLevel.WARNING
-    title = "ActiveDirectory Domain Validation Failed"
+    title = "Active Directory Domain Validation Failed"
     text = "Domain validation failed with error: %(verrs)s."
+
+
+class ActiveDirectoryDomainOfflineAlertClass(AlertClass, SimpleOneShotAlertClass):
+    category = AlertCategory.DIRECTORY_SERVICE
+    level = AlertLevel.WARNING
+    title = "Domain Offline"
+    text = "Active Directory Domain \"%(domain)s\" is Offline."
 
 
 class ActiveDirectoryDomainHealthAlertSource(AlertSource):
     schedule = CrontabSchedule(hour=1)
+    run_on_backup_node = False
 
     async def check(self):
         if await self.middleware.call('activedirectory.get_state') == 'DISABLED':
@@ -39,6 +47,7 @@ class ActiveDirectoryDomainHealthAlertSource(AlertSource):
 
 class ActiveDirectoryDomainBindAlertSource(AlertSource):
     schedule = IntervalSchedule(timedelta(minutes=10))
+    run_on_backup_node = False
 
     async def check(self):
         if (await self.middleware.call('activedirectory.get_state')) == 'DISABLED':

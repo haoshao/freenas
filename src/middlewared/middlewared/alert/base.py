@@ -1,6 +1,5 @@
 from datetime import timedelta
 import enum
-import hashlib
 import json
 import logging
 import os
@@ -33,9 +32,8 @@ class AlertClassMeta(type):
 
             cls.name = cls.__name__.replace("AlertClass", "")
 
-            if not cls.exclude_from_list:
-                AlertClass.classes.append(cls)
-                AlertClass.class_by_name[cls.name] = cls
+            AlertClass.classes.append(cls)
+            AlertClass.class_by_name[cls.name] = cls
 
 
 class AlertClass(metaclass=AlertClassMeta):
@@ -48,6 +46,7 @@ class AlertClass(metaclass=AlertClassMeta):
     text = None
 
     exclude_from_list = False
+    freenas_only = False
     hardware = False
 
     def __init__(self, middleware):
@@ -61,7 +60,7 @@ class AlertClass(metaclass=AlertClassMeta):
         if args is None:
             return cls.text
 
-        return cls.text % args
+        return cls.text % (tuple(args) if isinstance(args, list) else args)
 
 
 class OneShotAlertClass:
@@ -176,6 +175,7 @@ class Alert:
 class AlertSource:
     schedule = IntervalSchedule(timedelta())
 
+    freenas_only = False
     failover_related = False
     run_on_backup_node = True
 
@@ -229,9 +229,6 @@ class AlertService:
     async def send(self, alerts, gone_alerts, new_alerts):
         raise NotImplementedError
 
-    def _alert_id(self, alert):
-        return hashlib.sha256(json.dumps([alert.source, alert.key]).encode("utf-8")).hexdigest()
-
     async def _format_alerts(self, alerts, gone_alerts, new_alerts):
         product_name = await self.middleware.call("system.product_name")
         hostname = (await self.middleware.call("system.info"))["hostname"]
@@ -252,7 +249,11 @@ class ThreadedAlertService(AlertService):
     def _format_alerts(self, alerts, gone_alerts, new_alerts):
         product_name = self.middleware.call_sync("system.product_name")
         hostname = self.middleware.call_sync("system.info")["hostname"]
-        return format_alerts(product_name, hostname, alerts, gone_alerts, new_alerts)
+        if not self.middleware.call_sync("system.is_freenas"):
+            node_map = self.middleware.call_sync("alert.node_map")
+        else:
+            node_map = None
+        return format_alerts(product_name, hostname, node_map, alerts, gone_alerts, new_alerts)
 
 
 class ProThreadedAlertService(ThreadedAlertService):
@@ -286,11 +287,22 @@ class ProThreadedAlertService(ThreadedAlertService):
 def format_alerts(product_name, hostname, node_map, alerts, gone_alerts, new_alerts):
     text = f"{product_name} @ {hostname}\n\n"
 
+    if len(alerts) == 1 and len(gone_alerts) == 0 and len(new_alerts) == 1 and new_alerts[0].klass.name == "Test":
+        return text + "This is a test alert"
+
     if new_alerts:
-        text += "New alerts:\n" + "".join(["* %s\n" % format_alert(alert, node_map) for alert in new_alerts]) + "\n"
+        if len(gone_alerts) == 1:
+            text += "New alert"
+        else:
+            text += "New alerts"
+        text += ":\n" + "".join(["* %s\n" % format_alert(alert, node_map) for alert in new_alerts]) + "\n"
 
     if gone_alerts:
-        text += "Gone alerts:\n" + "".join(["* %s\n" % format_alert(alert, node_map) for alert in gone_alerts]) + "\n"
+        if len(gone_alerts) == 1:
+            text += "The following alert has been cleared"
+        else:
+            text += "These alerts have been cleared"
+        text += ":\n" + "".join(["* %s\n" % format_alert(alert, node_map) for alert in gone_alerts]) + "\n"
 
     if alerts:
         text += "Current alerts:\n" + "".join(["* %s\n" % format_alert(alert, node_map) for alert in alerts]) + "\n"
@@ -299,7 +311,7 @@ def format_alerts(product_name, hostname, node_map, alerts, gone_alerts, new_ale
 
 
 def format_alert(alert, node_map):
-    return (f"{node_map[alert.node]} - " if node_map else None) + alert.formatted
+    return (f"{node_map[alert.node]} - " if node_map else "") + alert.formatted
 
 
 def ellipsis(s, l):

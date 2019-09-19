@@ -3,8 +3,9 @@ from datetime import datetime
 import os
 import pickle
 
+from middlewared.common.attachment import FSAttachmentDelegate
 from middlewared.schema import accepts, Bool, Cron, Dict, Int, List, Patch, Path, Str
-from middlewared.service import item_method, private, CallError, CRUDService, ValidationErrors
+from middlewared.service import item_method, job, private, CallError, CRUDService, ValidationErrors
 from middlewared.utils.path import is_child
 from middlewared.validators import Port, Range, ReplicationSnapshotNamingSchema, Unique
 
@@ -118,6 +119,7 @@ class ReplicationService(CRUDService):
             Path("target_dataset", required=True, empty=False),
             Bool("recursive", required=True),
             List("exclude", items=[Path("dataset", empty=False)], default=[]),
+            Bool('properties', default=True),
             List("periodic_snapshot_tasks", items=[Int("periodic_snapshot_task")], default=[],
                  validators=[Unique()]),
             List("naming_schema", items=[
@@ -147,9 +149,9 @@ class ReplicationService(CRUDService):
             Str("lifetime_unit", null=True, default=None, enum=["HOUR", "DAY", "WEEK", "MONTH", "YEAR"]),
             Str("compression", enum=["LZ4", "PIGZ", "PLZIP"], null=True, default=None),
             Int("speed_limit", null=True, default=None, validators=[Range(min=1)]),
-            Bool("dedup", default=True),
+            Bool("dedup", default=False),
             Bool("large_block", default=True),
-            Bool("embed", default=True),
+            Bool("embed", default=False),
             Bool("compressed", default=True),
             Int("retries", default=5, validators=[Range(min=1)]),
             Str("logging_level", enum=["DEBUG", "INFO", "WARNING", "ERROR"], null=True, default=None),
@@ -179,6 +181,7 @@ class ReplicationService(CRUDService):
         * `source_datasets` is a non-empty list of datasets to replicate snapshots from
         * `target_dataset` is a dataset to put snapshots into. It must exist on target side
         * `recursive` and `exclude` have the same meaning as for Periodic Snapshot Task
+        * `properties` control whether we should send dataset properties along with snapshots
         * `periodic_snapshot_tasks` is a list of periodic snapshot task IDs that are sources of snapshots for this
           replication task. Only push replication tasks can be bound to periodic snapshot tasks.
         * `naming_schema` is a list of naming schemas for pull replication
@@ -317,7 +320,7 @@ class ReplicationService(CRUDService):
         new.update(data)
 
         verrors = ValidationErrors()
-        verrors.add_child("replication_update", await self._validate(new))
+        verrors.add_child("replication_update", await self._validate(new, id))
 
         if verrors:
             raise verrors
@@ -374,20 +377,27 @@ class ReplicationService(CRUDService):
         return response
 
     @item_method
-    @accepts(Int("id"))
-    async def run(self, id):
+    @accepts(Int("id"), Bool("really_run", default=True, hidden=True))
+    @job(logs=True)
+    async def run(self, job, id, really_run):
         """
         Run Replication Task of `id`.
         """
-        task = await self._get_instance(id)
+        if really_run:
+            task = await self._get_instance(id)
 
-        if not task["enabled"]:
-            raise CallError("Task is not enabled")
+            if not task["enabled"]:
+                raise CallError("Task is not enabled")
 
-        await self.middleware.call("zettarepl.run_replication_task", task["id"])
+            if task["transport"] == "LEGACY":
+                raise CallError("You can't run legacy replication manually")
 
-    async def _validate(self, data):
+        await self.middleware.call("zettarepl.run_replication_task", id, really_run, job)
+
+    async def _validate(self, data, id=None):
         verrors = ValidationErrors()
+
+        await self._ensure_unique(verrors, "", "name", data["name"], id)
 
         # Direction
 
@@ -494,6 +504,10 @@ class ReplicationService(CRUDService):
 
             if len(data["source_datasets"]) != 1:
                 verrors.add("source_datasets", "You can only have one source dataset for legacy replication")
+
+            if data["retention_policy"] not in ["SOURCE", "NONE"]:
+                verrors.add("retention_policy", "Only \"source\" and \"none\" retention policies are supported by "
+                                                "legacy replication")
 
             if data["retries"] != 1:
                 verrors.add("retries", "This value should be 1 for legacy replication")
@@ -627,21 +641,107 @@ class ReplicationService(CRUDService):
 
         return await self.middleware.call("zettarepl.create_dataset", dataset, transport, ssh_credentials)
 
+    @accepts()
+    async def list_naming_schemas(self):
+        """
+        List all naming schemas used in periodic snapshot and replication tasks.
+        """
+        naming_schemas = []
+        for snapshottask in await self.middleware.call("pool.snapshottask.query"):
+            naming_schemas.append(snapshottask["naming_schema"])
+        for replication in await self.middleware.call("replication.query"):
+            naming_schemas.extend(replication["naming_schema"])
+            naming_schemas.extend(replication["also_include_naming_schema"])
+        return sorted(set(naming_schemas))
+
+    @accepts(
+        List("datasets", empty=False, items=[
+            Path("dataset", empty=False),
+        ]),
+        List("naming_schema", empty=False, items=[
+            Str("naming_schema", validators=[ReplicationSnapshotNamingSchema()])
+        ]),
+        Str("transport", enum=["SSH", "SSH+NETCAT", "LOCAL", "LEGACY"], required=True),
+        Int("ssh_credentials", null=True, default=None),
+    )
+    async def count_eligible_manual_snapshots(self, datasets, naming_schema, transport, ssh_credentials):
+        """
+        Count how many existing snapshots of `dataset` match `naming_schema`.
+
+        .. examples(websocket)::
+
+            :::javascript
+            {
+                "id": "6841f242-840a-11e6-a437-00e04d680384",
+                "msg": "method",
+                "method": "replication.count_eligible_manual_snapshots",
+                "params": [
+                    "repl/work",
+                    ["auto-%Y-%m-%d_%H-%M"],
+                    "SSH",
+                    4
+                ]
+            }
+        """
+        return await self.middleware.call("zettarepl.count_eligible_manual_snapshots", datasets, naming_schema,
+                                          transport, ssh_credentials)
+
     # Legacy pair support
     @private
     @accepts(Dict(
         "replication-pair-data",
         Str("hostname", required=True),
         Str("public-key", required=True),
-        Str("user"),
+        Str("user", null=True),
     ))
     async def pair(self, data):
         result = await self.middleware.call("keychaincredential.ssh_pair", {
             "remote_hostname": data["hostname"],
-            "username": data["user"],
+            "username": data["user"] or "root",
             "public_key": data["public-key"],
         })
         return {
             "ssh_port": result["port"],
             "ssh_hostkey": result["host_key"],
         }
+
+
+class ReplicationFSAttachmentDelegate(FSAttachmentDelegate):
+    name = 'replication'
+    title = 'Replication'
+
+    async def query(self, path, enabled):
+        results = []
+        for replication in await self.middleware.call('replication.query', [['enabled', '=', enabled]]):
+            if replication['direction'] == 'PUSH':
+                if any(is_child(os.path.join('/mnt', source_dataset), path)
+                       for source_dataset in replication['source_datasets']):
+                    results.append(replication)
+
+            if replication['direction'] == 'PULL':
+                if is_child(os.path.join('/mnt', replication['target_dataset']), path):
+                    results.append(replication)
+
+        return results
+
+    async def get_attachment_name(self, attachment):
+        return attachment['name']
+
+    async def delete(self, attachments):
+        for attachment in attachments:
+            await self.middleware.call('datastore.delete', 'storage.replication', attachment['id'])
+
+        await self.middleware.call('service.restart', 'cron')
+        await self.middleware.call('zettarepl.update_tasks')
+
+    async def toggle(self, attachments, enabled):
+        for attachment in attachments:
+            await self.middleware.call('datastore.update', 'storage.replication', attachment['id'],
+                                       {'repl_enabled': enabled})
+
+        await self.middleware.call('service.restart', 'cron')
+        await self.middleware.call('zettarepl.update_tasks')
+
+
+async def setup(middleware):
+    await middleware.call('pool.dataset.register_attachment_delegate', ReplicationFSAttachmentDelegate(middleware))

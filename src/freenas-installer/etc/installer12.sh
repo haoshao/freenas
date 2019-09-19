@@ -399,9 +399,10 @@ install_loader()
 	    echo "Stamping EFI loader on: ${_disk}"
 	    mkdir -p /tmp/efi
 	    mount -t msdosfs /dev/${_disk}p1 /tmp/efi
-	    # Copy the .efi file
+	    # Copy the .efi file and create a fallback startup script
 	    mkdir -p /tmp/efi/efi/boot
 	    cp ${_mnt}/boot/boot1.efi /tmp/efi/efi/boot/BOOTx64.efi
+	    echo "BOOTx64.efi" > /tmp/efi/efi/boot/startup.nsh
 	    umount /tmp/efi
 	else
 	    echo "Stamping GPT loader on: ${_disk}"
@@ -571,11 +572,8 @@ partition_disks()
     else
 	_mirror=""
     fi
-    zpool create -f -o cachefile=/tmp/zpool.cache -o version=28 -O mountpoint=none -O atime=off -O canmount=off freenas-boot ${_mirror} ${_disksparts}
-    zpool set feature@async_destroy=enabled freenas-boot
-    zpool set feature@empty_bpobj=enabled freenas-boot
-    zpool set feature@lz4_compress=enabled freenas-boot
-    zfs set compress=lz4 freenas-boot
+    zpool create -f -o cachefile=/tmp/zpool.cache -O mountpoint=none -O atime=off -O canmount=off freenas-boot ${_mirror} ${_disksparts}
+    zfs set compression=on freenas-boot
     zfs create -o canmount=off freenas-boot/ROOT
     zfs create -o mountpoint=legacy freenas-boot/ROOT/${BENAME}
 

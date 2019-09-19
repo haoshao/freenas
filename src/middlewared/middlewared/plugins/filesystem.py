@@ -2,6 +2,7 @@ import binascii
 import bsd
 from bsd import acl
 import errno
+import enum
 import grp
 import os
 import pwd
@@ -10,9 +11,101 @@ import shutil
 import subprocess
 
 from middlewared.main import EventSource
-from middlewared.schema import Bool, Dict, Int, Ref, List, Str, accepts
+from middlewared.schema import Bool, Dict, Int, Ref, List, Str, UnixPerm, accepts
 from middlewared.service import private, CallError, Service, job
 from middlewared.utils import filter_list
+
+
+class ACLDefault(enum.Enum):
+    OPEN = [
+        {
+            'tag': 'owner@',
+            'id': None,
+            'perms': {'BASIC': 'FULL_CONTROL'},
+            'flags': {'BASIC': 'INHERIT'},
+            'type': 'ALLOW'
+        },
+        {
+            'tag': 'group@',
+            'id': None,
+            'perms': {'BASIC': 'FULL_CONTROL'},
+            'flags': {'BASIC': 'INHERIT'},
+            'type': 'ALLOW'
+        },
+        {
+            'tag': 'everyone@',
+            'id': None,
+            'perms': {'BASIC': 'MODIFY'},
+            'flags': {'BASIC': 'INHERIT'},
+            'type': 'ALLOW'
+        }
+    ]
+    RESTRICTED = [
+        {
+            'tag': 'owner@',
+            'id': None,
+            'perms': {'BASIC': 'FULL_CONTROL'},
+            'flags': {'BASIC': 'INHERIT'},
+            'type': 'ALLOW'
+        },
+        {
+            'tag': 'group@',
+            'id': None,
+            'perms': {'BASIC': 'MODIFY'},
+            'flags': {'BASIC': 'INHERIT'},
+            'type': 'ALLOW'
+        },
+    ]
+    HOME = [
+        {
+            'tag': 'owner@',
+            'id': None,
+            'perms': {'BASIC': 'FULL_CONTROL'},
+            'flags': {'BASIC': 'INHERIT'},
+            'type': 'ALLOW'
+        },
+        {
+            'tag': 'group@',
+            'id': None,
+            'perms': {'BASIC': 'MODIFY'},
+            'flags': {'BASIC': 'NOINHERIT'},
+            'type': 'ALLOW'
+        },
+        {
+            'tag': 'everyone@',
+            'id': None,
+            'perms': {'BASIC': 'TRAVERSE'},
+            'flags': {'BASIC': 'NOINHERIT'},
+            'type': 'ALLOW'
+        },
+    ]
+    DOMAIN_HOME = [
+        {
+            'tag': 'owner@',
+            'id': None,
+            'perms': {'BASIC': 'FULL_CONTROL'},
+            'flags': {'BASIC': 'INHERIT'},
+            'type': 'ALLOW'
+        },
+        {
+            'tag': 'group@',
+            'id': None,
+            'perms': {'BASIC': 'MODIFY'},
+            'flags': {
+                'DIRECTORY_INHERIT': True,
+                'INHERIT_ONLY': True,
+                'NO_PROPAGATE_INHERIT': True
+            },
+            'type': 'ALLOW'
+        },
+        {
+            'tag': 'everyone@',
+            'id': None,
+            'perms': {'BASIC': 'TRAVERSE'},
+            'flags': {'BASIC': 'NOINHERIT'},
+            'type': 'ALLOW'
+        }
+    ]
 
 
 class FilesystemService(Service):
@@ -101,19 +194,14 @@ class FilesystemService(Service):
         except KeyError:
             stat['group'] = None
 
-        if os.path.exists(os.path.join(path, ".windows")):
-            stat["acl"] = "windows"
-        elif os.path.exists(os.path.join(path, ".apple")):
-            stat["acl"] = "mac"
-        else:
-            stat["acl"] = "unix"
+        stat['acl'] = False if self.middleware.call_sync('filesystem.acl_is_trivial', path) else True
 
         return stat
 
     @private
     @accepts(
         Str('path'),
-        Str('content'),
+        Str('content', max_length=512000),
         Dict(
             'options',
             Bool('append', default=False),
@@ -125,8 +213,6 @@ class FilesystemService(Service):
         Simplified file receiving method for small files.
 
         `content` must be a base 64 encoded file content.
-
-        DISCLAIMER: DO NOT USE THIS FOR BIG FILES (> 500KB).
         """
         options = options or {}
         dirname = os.path.dirname(path)
@@ -290,6 +376,17 @@ class FilesystemService(Service):
 
         return flagset
 
+    def _winacl(self, path, action, uid, gid, options):
+        winacl = subprocess.run([
+            '/usr/local/bin/winacl',
+            '-a', action,
+            '-O', str(uid), '-G', str(gid),
+            '-rx' if options['traverse'] else '-r',
+            '-p', path], check=False, capture_output=True
+        )
+        if winacl.returncode != 0:
+            CallError(f"Winacl {action} on path {path} failed with error: [{winacl.stderr.decode().strip()}]")
+
     @accepts(Str('path'))
     def acl_is_trivial(self, path):
         """
@@ -303,18 +400,232 @@ class FilesystemService(Service):
         return a.is_trivial
 
     @accepts(
+        Dict(
+            'filesystem_ownership',
+            Str('path', required=True),
+            Int('uid', null=True, default=None),
+            Int('gid', null=True, default=None),
+            Dict(
+                'options',
+                Bool('recursive', default=False),
+                Bool('traverse', default=False)
+            )
+        )
+    )
+    @job(lock="perm_change")
+    def chown(self, job, data):
+        """
+        Change owner or group of file at `path`.
+
+        `uid` and `gid` specify new owner of the file. If either
+        key is absent or None, then existing value on the file is not
+        changed.
+
+        `recursive` performs action recursively, but does
+        not traverse filesystem mount points.
+
+        If `traverse` and `recursive` are specified, then the chown
+        operation will traverse filesystem mount points.
+        """
+        if not os.path.exists(data['path']):
+            raise CallError(f"Path {data['path']} not found.", errno.ENOENT)
+
+        if not os.path.realpath(data['path']).startswith('/mnt/'):
+            raise CallError(f"Changing ownership on path {data['path']} is not permitted.", errno.EPERM)
+
+        uid = -1 if data['uid'] is None else data['uid']
+        gid = -1 if data['gid'] is None else data['gid']
+        options = data['options']
+
+        if not options['recursive']:
+            os.chown(data['path'], uid, gid)
+        else:
+            self._winacl(data['path'], 'chown', uid, gid, options)
+
+    @accepts(
+        Dict(
+            'filesystem_permission',
+            Str('path', required=True),
+            UnixPerm('mode', null=True),
+            Int('uid', null=True, default=None),
+            Int('gid', null=True, default=None),
+            Dict(
+                'options',
+                Bool('stripacl', default=False),
+                Bool('recursive', default=False),
+                Bool('traverse', default=False),
+            )
+        )
+    )
+    @job(lock="perm_change")
+    def setperm(self, job, data):
+        """
+        Remove extended ACL from specified path.
+
+        If `mode` is specified then the mode will be applied to the
+        path and files and subdirectories depending on which `options` are
+        selected. Mode should be formatted as string representation of octal
+        permissions bits.
+
+        `uid` the desired UID of the file user. If set to None (the default), then user is not changed.
+
+        `gid` the desired GID of the file group. If set to None (the default), then group is not changed.
+
+        `stripacl` setperm will fail if an extended ACL is present on `path`,
+        unless `stripacl` is set to True.
+
+        `recursive` remove ACLs recursively, but do not traverse dataset
+        boundaries.
+
+        `traverse` remove ACLs from child datasets.
+
+        If no `mode` is set, and `stripacl` is True, then non-trivial ACLs
+        will be converted to trivial ACLs. An ACL is trivial if it can be
+        expressed as a file mode without losing any access rules.
+
+        """
+        options = data['options']
+        mode = data.get('mode', None)
+
+        uid = -1 if data['uid'] is None else data['uid']
+        gid = -1 if data['gid'] is None else data['gid']
+
+        if not os.path.exists(data['path']):
+            raise CallError('Path not found.', errno.ENOENT)
+
+        if not os.path.realpath(data['path']).startswith('/mnt/'):
+            raise CallError(f"Changing permission on path {data['path']} is not permitted.", errno.EPERM)
+
+        acl_is_trivial = self.middleware.call_sync('filesystem.acl_is_trivial', data['path'])
+        if not acl_is_trivial and not options['stripacl']:
+            raise CallError(
+                f'Non-trivial ACL present on [{data["path"]}]. Option "stripacl" required to change permission.'
+            )
+
+        if mode is not None:
+            mode = int(mode, 8)
+
+        a = acl.ACL(file=data['path'])
+        a.strip()
+        a.apply(data['path'])
+
+        if mode:
+            os.chmod(data['path'], mode)
+
+        if uid or gid:
+            os.chown(data['path'], uid, gid)
+
+        if not options['recursive']:
+            return
+
+        action = 'clone' if mode else 'strip'
+        self._winacl(data['path'], action, uid, gid, options)
+
+    @accepts()
+    async def default_acl_choices(self):
+        """
+        Get list of default ACL types.
+        """
+        return [x.name for x in ACLDefault]
+
+    @accepts(
+        Str('acl_type', default='OPEN', enum=[x.name for x in ACLDefault])
+    )
+    async def get_default_acl(self, acl_type):
+        """
+        Returns a default ACL depending on the usage specified by `acl_type`.
+        If an admin group is defined, then an entry granting it full control will
+        be placed at the top of the ACL.
+        """
+        acl = []
+        admin_group = (await self.middleware.call('smb.config'))['admin_group']
+        if admin_group:
+            acl.append({
+                'tag': 'GROUP',
+                'id': (await self.middleware.call('dscache.get_uncached_group', admin_group))['gr_gid'],
+                'perms': {'BASIC': 'FULL_CONTROL'},
+                'flags': {'BASIC': 'INHERIT'},
+                'type': 'ALLOW'
+            })
+        acl.extend(ACLDefault[acl_type].value)
+
+        return acl
+
+    def _is_inheritable(self, flags):
+        """
+        Takes ACE flags and return True if any inheritance bits are set.
+        """
+        inheritance_flags = ['FILE_INHERIT', 'DIRECTORY_INHERIT', 'NO_PROPAGATE_INHERIT', 'INHERIT_ONLY']
+        for i in inheritance_flags:
+            if flags.get(i):
+                return True
+
+        return False
+
+    @private
+    def canonicalize_acl_order(self, acl):
+        """
+        Convert flags to advanced, then separate the ACL into two lists. One for ACEs that have been inherited,
+        one for aces that have not been inherited. Non-inherited ACEs take precedence
+        and so they are placed first in finalized combined list. Within each list, the
+        ACEs are orderd according to the following:
+
+        1) Deny ACEs that apply to the object itself (NOINHERIT)
+
+        2) Deny ACEs that apply to a subobject of the object (INHERIT)
+
+        3) Allow ACEs that apply to the object itself (NOINHERIT)
+
+        4) Allow ACEs that apply to a subobject of the object (INHERIT)
+
+        See http://docs.microsoft.com/en-us/windows/desktop/secauthz/order-of-aces-in-a-dacl
+
+        The "INHERITED" bit is stripped in filesystem.getacl when generating a BASIC flag type.
+        It is best practice to use a non-simplified ACL for canonicalization.
+        """
+        inherited_aces = []
+        final_acl = []
+        non_inherited_aces = []
+        for entry in acl:
+            entry['flags'] = self.__convert_to_adv_flagset(entry['flags']['BASIC']) if 'BASIC' in entry['flags'] else entry['flags']
+            if entry['flags'].get('INHERITED'):
+                inherited_aces.append(entry)
+            else:
+                non_inherited_aces.append(entry)
+
+        if inherited_aces:
+            inherited_aces = sorted(
+                inherited_aces,
+                key=lambda x: (x['type'] == 'ALLOW', self._is_inheritable(x['flags'])),
+            )
+        if non_inherited_aces:
+            non_inherited_aces = sorted(
+                non_inherited_aces,
+                key=lambda x: (x['type'] == 'ALLOW', self._is_inheritable(x['flags'])),
+            )
+        final_acl = non_inherited_aces + inherited_aces
+        return final_acl
+
+    @accepts(
         Str('path'),
         Bool('simplified', default=True),
     )
     def getacl(self, path, simplified=True):
         """
         Return ACL of a given path.
+
         Simplified returns a shortened form of the ACL permset and flags
-        - TRAVERSE = sufficient rights to traverse a directory, but not read contents.
-        - READ = sufficient rights to traverse a directory, and read file contents.
-        - MODIFIY = sufficient rights to traverse, read, write, and modify a file. Equivalent to modify_set.
-        - FULL_CONTROL = all permissions.
-        - OTHER = does not fit into any of the above categories without losing information.
+
+        `TRAVERSE` sufficient rights to traverse a directory, but not read contents.
+
+        `READ` sufficient rights to traverse a directory, and read file contents.
+
+        `MODIFIY` sufficient rights to traverse, read, write, and modify a file. Equivalent to modify_set.
+
+        `FULL_CONTROL` all permissions.
+
+        If the permisssions do not fit within one of the pre-defined simplified permissions types, then
+        the full ACL entry will be returned.
 
         In all cases we replace USER_OBJ, GROUP_OBJ, and EVERYONE with owner@, group@, everyone@ for
         consistency with getfacl and setfacl. If one of aforementioned special tags is used, 'id' must
@@ -326,6 +637,8 @@ class FilesystemService(Service):
         """
         if not os.path.exists(path):
             raise CallError('Path not found.', errno.ENOENT)
+
+        stat = os.stat(path)
 
         a = acl.ACL(file=path)
         fs_acl = a.__getstate__()
@@ -341,10 +654,11 @@ class FilesystemService(Service):
                     'flags': entry['flags'],
                 }
                 if ace['tag'] == 'everyone@' and self.__convert_to_basic_permset(ace['perms']) == 'NOPERMS':
-                    self.logger.debug('detected hidden ace')
                     continue
+
                 advanced_acl.append(ace)
-            return advanced_acl
+
+            return {'uid': stat.st_uid, 'gid': stat.st_gid, 'acl': advanced_acl}
 
         if simplified:
             simple_acl = []
@@ -358,69 +672,90 @@ class FilesystemService(Service):
                 }
                 if ace['tag'] == 'everyone@' and ace['perms']['BASIC'] == 'NOPERMS':
                     continue
+
+                for key in ['perms', 'flags']:
+                    if ace[key]['BASIC'] == 'OTHER':
+                        ace[key] = entry[key]
+
                 simple_acl.append(ace)
 
-            return simple_acl
+            return {'uid': stat.st_uid, 'gid': stat.st_gid, 'acl': simple_acl}
 
     @accepts(
-        Str('path'),
-        List(
-            'dacl',
-            items=[
-                Dict(
-                    'aclentry',
-                    Str('tag', enum=['owner@', 'group@', 'everyone@', 'USER', 'GROUP']),
-                    Int('id', null=True),
-                    Str('type', enum=['ALLOW', 'DENY']),
-                    Dict(
-                        'perms',
-                        Bool('READ_DATA'),
-                        Bool('WRITE_DATA'),
-                        Bool('APPEND_DATA'),
-                        Bool('READ_NAMED_ATTRS'),
-                        Bool('WRITE_NAMED_ATTRS'),
-                        Bool('EXECUTE'),
-                        Bool('DELETE_CHILD'),
-                        Bool('READ_ATTRIBUTES'),
-                        Bool('WRITE_ATTRIBUTES'),
-                        Bool('DELETE'),
-                        Bool('READ_ACL'),
-                        Bool('WRITE_ACL'),
-                        Bool('WRITE_OWNER'),
-                        Bool('SYNCHRONIZE'),
-                        Str('BASIC', enum=['FULL_CONTROL', 'MODIFY', 'READ', 'OTHER']),
-                    ),
-                    Dict(
-                        'flags',
-                        Bool('FILE_INHERIT'),
-                        Bool('DIRECTORY_INHERIT'),
-                        Bool('NO_PROPAGATE_INHERIT'),
-                        Bool('INHERIT_ONLY'),
-                        Bool('INHERITED'),
-                        Str('BASIC', enum=['INHERIT', 'NOINHERIT', 'OTHER']),
-                    ),
-                )
-            ],
-            default=[]
-        ),
         Dict(
-            'options',
-            Bool('stripacl', default=False),
-            Bool('recursive', default=False),
-            Bool('traverse', default=False),
+            'filesystem_acl',
+            Str('path', required=True),
+            Int('uid', null=True, default=None),
+            Int('gid', null=True, default=None),
+            List(
+                'dacl',
+                items=[
+                    Dict(
+                        'aclentry',
+                        Str('tag', enum=['owner@', 'group@', 'everyone@', 'USER', 'GROUP']),
+                        Int('id', null=True),
+                        Str('type', enum=['ALLOW', 'DENY']),
+                        Dict(
+                            'perms',
+                            Bool('READ_DATA'),
+                            Bool('WRITE_DATA'),
+                            Bool('APPEND_DATA'),
+                            Bool('READ_NAMED_ATTRS'),
+                            Bool('WRITE_NAMED_ATTRS'),
+                            Bool('EXECUTE'),
+                            Bool('DELETE_CHILD'),
+                            Bool('READ_ATTRIBUTES'),
+                            Bool('WRITE_ATTRIBUTES'),
+                            Bool('DELETE'),
+                            Bool('READ_ACL'),
+                            Bool('WRITE_ACL'),
+                            Bool('WRITE_OWNER'),
+                            Bool('SYNCHRONIZE'),
+                            Str('BASIC', enum=['FULL_CONTROL', 'MODIFY', 'READ', 'TRAVERSE']),
+                        ),
+                        Dict(
+                            'flags',
+                            Bool('FILE_INHERIT'),
+                            Bool('DIRECTORY_INHERIT'),
+                            Bool('NO_PROPAGATE_INHERIT'),
+                            Bool('INHERIT_ONLY'),
+                            Bool('INHERITED'),
+                            Str('BASIC', enum=['INHERIT', 'NOINHERIT']),
+                        ),
+                    )
+                ],
+                default=[]
+            ),
+            Dict(
+                'options',
+                Bool('stripacl', default=False),
+                Bool('recursive', default=False),
+                Bool('traverse', default=False),
+                Bool('canonicalize', default=True)
+            )
         )
     )
-    @job(lock=lambda args: f'setacl:{args[0]}')
-    def setacl(self, job, path, dacl, options):
+    @job(lock="perm_change")
+    def setacl(self, job, data):
         """
         Set ACL of a given path. Takes the following parameters:
-        :path: realpath or relative path. We make a subsequent realpath call to resolve it.
-        :dacl: Accept a "simplified" ACL here or a full ACL. If the simplified ACL
-        contains ACE perms or flags that are "SPECIAL", then raise a validation error.
-        :recursive: apply the ACL recursively
-        :traverse: traverse filestem boundaries (ZFS datasets)
-        :strip: convert ACL to trivial. ACL is trivial if it can be expressed as a file mode without
+        `path` full path to directory or file.
+
+        `dacl` "simplified" ACL here or a full ACL.
+
+        `uid` the desired UID of the file user. If set to None (the default), then user is not changed.
+
+        `gid` the desired GID of the file group. If set to None (the default), then group is not changed.
+
+        `recursive` apply the ACL recursively
+
+        `traverse` traverse filestem boundaries (ZFS datasets)
+
+        `strip` convert ACL to trivial. ACL is trivial if it can be expressed as a file mode without
         losing any access rules.
+
+        `canonicalize` reorder ACL entries so that they are in concanical form as described
+        in the Microsoft documentation MS-DTYP 2.4.5 (ACL)
 
         In all cases we replace USER_OBJ, GROUP_OBJ, and EVERYONE with owner@, group@, everyone@ for
         consistency with getfacl and setfacl. If one of aforementioned special tags is used, 'id' must
@@ -430,32 +765,45 @@ class FilesystemService(Service):
         expectations regarding permissions inheritance. This entry is removed from NT ACL returned
         to SMB clients when 'ixnas' samba VFS module is enabled.
         """
-        if not os.path.exists(path):
+        options = data['options']
+        dacl = data.get('dacl', [])
+        if not os.path.exists(data['path']):
             raise CallError('Path not found.', errno.ENOENT)
+
+        if not os.path.realpath(data['path']).startswith('/mnt/'):
+            raise CallError(f"Changing ACL on path {data['path']} is not permitted.", errno.EPERM)
 
         if dacl and options['stripacl']:
             raise CallError('Setting ACL and stripping ACL are not permitted simultaneously.', errno.EINVAL)
 
+        uid = -1 if data.get('uid', None) is None else data['uid']
+        gid = -1 if data.get('gid', None) is None else data['gid']
         if options['stripacl']:
-            a = acl.ACL(file=path)
+            a = acl.ACL(file=data['path'])
             a.strip()
-            a.apply(path)
+            a.apply(data['path'])
         else:
             cleaned_acl = []
             lockace_is_present = False
             for entry in dacl:
-                if entry['perms'].get('BASIC') == 'OTHER' or entry['flags'].get('BASIC') == 'OTHER':
-                    raise CallError('Unable to apply simplified ACL due to OTHER entry. Use full ACL.', errno.EINVAL)
                 ace = {
                     'tag': (acl.ACLWho(entry['tag'])).name,
                     'id': entry['id'],
                     'type': entry['type'],
                     'perms': self.__convert_to_adv_permset(entry['perms']['BASIC']) if 'BASIC' in entry['perms'] else entry['perms'],
-                    'flags': self.__convert_to_adv_flagset(entry['flags']['BASIC']) if 'BASIC' in entry['perms'] else entry['flags'],
+                    'flags': self.__convert_to_adv_flagset(entry['flags']['BASIC']) if 'BASIC' in entry['flags'] else entry['flags'],
                 }
+                if ace['flags']['INHERIT_ONLY'] and not ace['flags'].get('DIRECTORY_INHERIT', False) and not ace['flags'].get('FILE_INHERIT', False):
+                    raise CallError(
+                        'Invalid flag combination. DIRECTORY_INHERIT or FILE_INHERIT must be set if INHERIT_ONLY is set.',
+                        errno.EINVAL
+                    )
                 if ace['tag'] == 'EVERYONE' and self.__convert_to_basic_permset(ace['perms']) == 'NOPERMS':
                     lockace_is_present = True
                 cleaned_acl.append(ace)
+            if options['canonicalize']:
+                cleaned_acl = self.canonicalize_acl_order(cleaned_acl)
+
             if not lockace_is_present:
                 locking_ace = {
                     'tag': 'EVERYONE',
@@ -468,22 +816,12 @@ class FilesystemService(Service):
 
             a = acl.ACL()
             a.__setstate__(cleaned_acl)
-            a.apply(path)
+            a.apply(data['path'])
 
         if not options['recursive']:
-            self.logger.debug('exiting early on non-recursive task')
             return True
 
-        winacl = subprocess.run([
-            '/usr/local/bin/winacl',
-            '-a', 'clone',
-            f"{'-rx' if options['traverse'] else '-r'}",
-            '-p', path], check=False
-        )
-        if winacl.returncode != 0:
-            raise CallError(f"Failed to recursively apply ACL: {winacl.stderr.decode()}")
-
-        return True
+        self._winacl(data['path'], 'clone', uid, gid, options)
 
 
 class FileFollowTailEventSource(EventSource):

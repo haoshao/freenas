@@ -1,22 +1,23 @@
 import functools
 from itertools import chain
 
+import asyncio
+
 from middlewared.common.camcontrol import camcontrol_list
-from middlewared.common.smart.smartctl import get_smartctl_args
+from middlewared.common.smart.smartctl import SMARTCTL_POWERMODES, get_smartctl_args
 from middlewared.schema import accepts, Bool, Cron, Dict, Int, List, Patch, Str
-from middlewared.validators import Email, Range, Unique
+from middlewared.validators import Range
 from middlewared.service import CRUDService, filterable, filter_list, private, SystemServiceService, ValidationErrors
 from middlewared.utils import run
 from middlewared.utils.asyncio_ import asyncio_map
 
 
-async def annotate_disk_smart_tests(devices, disk):
-    if disk["disk"] is None or disk["disk"].startswith("nvd"):
-        return None
+async def annotate_disk_smart_tests(middleware, devices, disk):
+    if disk["disk"] is None:
+        return
 
-    device = devices.get(disk["disk"])
-    if device:
-        args = await get_smartctl_args(disk["disk"], device)
+    args = await get_smartctl_args(middleware, devices, disk["disk"])
+    if args:
         p = await run(["smartctl", "-l", "selftest"] + args, check=False, encoding="utf8")
         tests = parse_smart_selftest_results(p.stdout)
         if tests is not None:
@@ -223,7 +224,7 @@ class SMARTTestService(CRUDService):
             {'prefix': self._config.datastore_prefix}
         )
 
-        await self._service_change('smartd', 'restart')
+        asyncio.ensure_future(self._service_change('smartd', 'restart'))
 
         return data
 
@@ -275,7 +276,7 @@ class SMARTTestService(CRUDService):
             {'prefix': self._config.datastore_prefix}
         )
 
-        await self._service_change('smartd', 'restart')
+        asyncio.ensure_future(self._service_change('smartd', 'restart'))
 
         return await self.query(filters=[('id', '=', id)], options={'get': True})
 
@@ -292,7 +293,7 @@ class SMARTTestService(CRUDService):
             id
         )
 
-        await self._service_change('smartd', 'restart')
+        asyncio.ensure_future(self._service_change('smartd', 'restart'))
 
         return response
 
@@ -393,7 +394,10 @@ class SMARTTestService(CRUDService):
 
         devices = await camcontrol_list()
         return filter_list(
-            list(filter(None, await asyncio_map(functools.partial(annotate_disk_smart_tests, devices), disks, 16))),
+            list(filter(
+                None,
+                await asyncio_map(functools.partial(annotate_disk_smart_tests, self.middleware, devices), disks, 16)
+            )),
             [],
             {"get": get},
         )
@@ -404,23 +408,22 @@ class SmartService(SystemServiceService):
     class Config:
         service = "smartd"
         service_model = "smart"
+        service_verb_sync = False
         datastore_extend = "smart.smart_extend"
         datastore_prefix = "smart_"
 
     @private
     async def smart_extend(self, smart):
         smart["powermode"] = smart["powermode"].upper()
-        smart["email"] = smart["email"].split(",")
         return smart
 
     @accepts(Dict(
         'smart_update',
         Int('interval'),
-        Str('powermode', enum=['NEVER', 'SLEEP', 'STANDBY', 'IDLE']),
+        Str('powermode', enum=SMARTCTL_POWERMODES),
         Int('difference'),
         Int('informational'),
         Int('critical'),
-        List('email', validators=[Unique()], items=[Str('email', validators=[Email()])]),
         update=True
     ))
     async def do_update(self, data):
@@ -433,14 +436,6 @@ class SmartService(SystemServiceService):
         `critical`, `informational` and `difference` are integer values on which alerts for SMART are configured if
         the disks temperature crosses the assigned threshold for each respective attribute. They default to 0 which
         indicates they are disabled.
-
-        Email of log level LOG_CRIT is issued when disk temperature crosses `critical`.
-
-        Email of log level LOG_INFO is issued when disk temperature crosses `informational`.
-
-        If temperature of a disk changes by `difference` degree Celsius since the last report, SMART reports this.
-
-        `email` is a list of valid emails to receive SMART alerts.
         """
         old = await self.config()
 
@@ -448,9 +443,12 @@ class SmartService(SystemServiceService):
         new.update(data)
 
         new["powermode"] = new["powermode"].lower()
-        new["email"] = ",".join([email.strip() for email in new["email"]])
 
-        await self._update_service(old, new)
+        verb = "reload"
+        if any(old[k] != new[k] for k in ["interval"]):
+            verb = "restart"
+
+        await self._update_service(old, new, verb)
 
         if new["powermode"] != old["powermode"]:
             await self.middleware.call("service.restart", "collectd", {"onetime": False})

@@ -76,6 +76,19 @@ from requests.packages.urllib3 import poolmanager
 from requests.packages.urllib3.connectionpool import HTTPSConnectionPool
 
 
+class FailoverIsEnabledException(Exception):
+    pass
+
+
+def ensure_failover_is_disabled():
+    if not notifier().is_freenas():
+        from freenasUI.failover.models import Failover
+        qs = Failover.objects.all()
+        if qs.exists():
+            if not qs[0].disabled:
+                raise FailoverIsEnabledException()
+
+
 # Custom class to avoid warning about unverified SSL, see #16474
 class HTTPSConnectionPoolNoWarn(HTTPSConnectionPool):
     def _validate_conn(self, conn):
@@ -166,6 +179,8 @@ def get_lagg_proto():
     while True:
         protos = { }
         types = LAGGType
+        if  not notifier().is_freenas() and notifier().failover_licensed():
+            types = list(filter(lambda x: x[0] != 'failover', types))
         for i, t in enumerate(types):
             protos[i] = t[0]
             print("%d) %s" % (i + 1, protos[i]))
@@ -239,7 +254,7 @@ def configure_interface():
             print(_("ok"))
             print(_("Restarting routing:"), end=' ')
             try:
-                notifier().restart("routing")
+                notifier().reload("networkgeneral")
             except:
                 print(_("Failed"))
             print(_("ok"))
@@ -250,9 +265,9 @@ def configure_interface():
             continue
 
     while True:
-        _input = input(_("Reset network configuration? (y/n) ")).lower()
+        _input = input(_("Remove the current settings of this interface? (This causes a momentary disconnection of the network.) (y/n) ")).lower()
         if _input.startswith("y"):
-            print(_("Resetting interface configuration:"), end=' ')
+            print(_("Removing interface configuration:"), end=' ')
             try:
                 if iface.id != None:
                     iface.int_ipv4address = ''
@@ -279,7 +294,7 @@ def configure_interface():
             print(_("ok"))
             print(_("Restarting routing:"), end=' ')
             try:
-                notifier().restart("routing")
+                notifier().reload("networkgeneral")
             except:
                 print(_("Failed"))
             print(_("ok"))
@@ -333,11 +348,11 @@ def configure_interface():
                 int_name = iface.int_name
             if not _n.is_freenas() and _n.failover_licensed():
                 if _n.failover_node() == 'A':
-                    ip_label = "IPv4 Address (This Node)"
-                    ip_b_label = "IPv4 Address (Node B)"
+                    ip_label = "IPv4 Address (This TrueNAS Controller)"
+                    ip_b_label = "IPv4 Address (TrueNAS Controller 2)"
                 else:
-                    ip_label = "IPv4 Address (Node A)"
-                    ip_b_label = "IPv4 Address (This Node)"
+                    ip_label = "IPv4 Address (TrueNAS Controller 1)"
+                    ip_b_label = "IPv4 Address (This TrueNAS Controller)"
                 ip_prompt = prompt(ip_label, iface.int_ipv4address)
                 ip_b_prompt = prompt(ip_b_label, iface.int_ipv4address_b)
             else:
@@ -560,7 +575,7 @@ Acceptable formats are 255.255.255.0,
     if need_restart == "DHCP":
         print(_("Restarting routing:"), end=' ')
         try:
-            notifier().restart("routing")
+            notifier().reload("networkgeneral")
         except:
             print(_("Failed"))
         print(_("ok"))
@@ -1002,7 +1017,7 @@ def configure_default_route(*args):
     if need_save:
         print(_("Restarting routing:"), end=' ')
         try:
-            notifier().restart("routing")
+            notifier().reload("networkgeneral")
         except:
             print(_("Failed"))
             return False
@@ -1043,7 +1058,7 @@ def configure_static_routes(*args):
     print(_("ok"))
     try:
         print(_("Restarting routing:"), end=' ')
-        notifier().restart("routing")
+        notifier().reload("networkgeneral")
     except:
         print(_("Failed"))
         return False
@@ -1346,8 +1361,15 @@ def main_menu():
         except ValueError:
             ch = None
         if ch in menu_map:
-            menu_map[ch][1]()
-        continue
+            f = menu_map[ch][1]
+            try:
+                if f not in [reset_root_pw, reset_factory_defaults, shell, reboot, shutdown]:
+                    ensure_failover_is_disabled()
+                f()
+            except FailoverIsEnabledException:
+                print("You can't perform this action unless failover is administratively disabled")
+                print("Press Enter to return to console")
+                input()
 
 
 #

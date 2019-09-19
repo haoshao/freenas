@@ -1,4 +1,4 @@
-from middlewared.alert.base import AlertCategory, AlertClass, AlertLevel, SimpleOneShotAlertClass
+from middlewared.alert.base import Alert, AlertCategory, AlertClass, AlertLevel, OneShotAlertClass
 from middlewared.rclone.base import BaseRcloneRemote
 from middlewared.schema import accepts, Bool, Cron, Dict, Int, List, Patch, Str
 from middlewared.service import (
@@ -28,8 +28,7 @@ import subprocess
 import tempfile
 import textwrap
 
-CHUNK_SIZE = 5 * 1024 * 1024
-RE_TRANSF = re.compile(r"Transferred:\s*?(.+)$", re.S)
+RE_TRANSF = re.compile(r"Transferred:\s*(?P<progress_1>.+, )(?P<progress>[0-9]+)%, (?P<progress_2>.+)$", re.S)
 
 REMOTES = {}
 
@@ -195,24 +194,42 @@ async def rclone(middleware, job, cloud_sync):
             stderr=subprocess.STDOUT,
         )
         check_cloud_sync = asyncio.ensure_future(rclone_check_progress(job, proc))
-        await proc.wait()
-        await asyncio.wait_for(check_cloud_sync, None)
+        cancelled_error = None
+        try:
+            try:
+                await proc.wait()
+            except asyncio.CancelledError as e:
+                cancelled_error = e
+                try:
+                    await middleware.call("service.terminate_process", proc.pid)
+                except CallError as e:
+                    job.middleware.logger.warning(f"Error terminating rclone on cloud sync abort: {e!r}")
+        finally:
+            await asyncio.wait_for(check_cloud_sync, None)
 
         if snapshot:
             await middleware.call("zfs.snapshot.remove", snapshot)
 
+        if cancelled_error is not None:
+            raise cancelled_error
         if proc.returncode != 0:
-            raise ValueError("rclone failed")
+            message = "rclone failed"
+            if "dropbox__restricted_content" in job.internal_data:
+                message = "DropBox restricted content"
+            raise ValueError(message)
 
         await run_script(job, env, cloud_sync["post_script"], "Post-script")
 
-        if REMOTES[cloud_sync["credentials"]["provider"]].refresh_credentials:
+        refresh_credentials = REMOTES[cloud_sync["credentials"]["provider"]].refresh_credentials
+        if refresh_credentials:
             credentials_attributes = cloud_sync["credentials"]["attributes"].copy()
             updated = False
             ini = configparser.ConfigParser()
             ini.read(config.config_path)
             for key, value in ini["remote"].items():
-                if key in credentials_attributes and credentials_attributes[key] != value:
+                if (key in refresh_credentials and
+                        key in credentials_attributes and
+                        credentials_attributes[key] != value):
                     logger.debug("Updating credentials attributes key %r", key)
                     credentials_attributes[key] = value
                     updated = True
@@ -261,16 +278,29 @@ async def run_script_check(job, proc, name):
 
 
 async def rclone_check_progress(job, proc):
+    dropbox__restricted_content = False
     while True:
         read = (await proc.stdout.readline()).decode()
         if read == "":
             break
+        if "failed to open source object: path/restricted_content/" in read:
+            job.internal_data["dropbox__restricted_content"] = True
+            dropbox__restricted_content = True
         job.logs_fd.write(read.encode("utf-8", "ignore"))
         reg = RE_TRANSF.search(read)
         if reg:
-            transferred = reg.group(1).strip()
-            if not transferred.isdigit():
-                job.set_progress(None, transferred)
+            job.set_progress(int(reg.group("progress")), reg.group("progress_1") + reg.group("progress_2"))
+
+    if dropbox__restricted_content:
+        message = "\n" + (
+            "Dropbox sync failed due to restricted content being present in one of the folders. This may include\n"
+            "copyrighted content or the DropBox manual PDF that appears in the home directory after signing up.\n"
+            "All other files were synchronized, but no deletions were performed as synchronization is considered\n"
+            "unsuccessful. Please inspect logs to determine which files are considered restricted and exclude them\n"
+            "from your synchronization. If you think that files are restricted erroneously, contact\n"
+            "Dropbox Support: https://www.dropbox.com/support"
+        )
+        job.logs_fd.write(message.encode("utf-8", "ignore"))
 
 
 def rclone_encrypt_password(password):
@@ -287,8 +317,6 @@ def rclone_encrypt_password(password):
 
 
 def get_dataset_recursive(datasets, directory):
-    datasets = flatten_datasets(datasets)
-
     datasets = [
         dict(dataset, prefixlen=len(
             os.path.dirname(os.path.commonprefix([dataset["mountpoint"] + "/", directory + "/"]))))
@@ -311,10 +339,6 @@ def get_dataset_recursive(datasets, directory):
         for ds in datasets
         if ds != dataset
     )
-
-
-def flatten_datasets(datasets):
-    return sum([[ds] + flatten_datasets(ds["children"]) for ds in datasets], [])
 
 
 class _FsLockCore(aiorwlock._RWLockCore):
@@ -362,11 +386,28 @@ class FsLockManager:
         self.locks.pop(path)
 
 
-class CloudSyncTaskFailedAlertClass(AlertClass, SimpleOneShotAlertClass):
+class CloudSyncTaskFailedAlertClass(AlertClass, OneShotAlertClass):
     category = AlertCategory.TASKS
     level = AlertLevel.ERROR
     title = "Cloud Sync Task Failed"
-    text = "Cloud sync task %(name)s failed."
+    text = "Cloud sync task \"%(name)s\" failed."
+
+    async def create(self, args):
+        return Alert(CloudSyncTaskFailedAlertClass, args, key=args["id"])
+
+    async def delete(self, alerts, query):
+        return list(filter(
+            lambda alert: alert.key != str(query),
+            alerts
+        ))
+
+
+def lsjson_error_excerpt(error):
+    excerpt = error.split("\n")[0]
+    excerpt = re.sub(r"^[0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ", "", excerpt)
+    excerpt = excerpt.replace("Failed to create file system for \"remote:\": ", "")
+    excerpt = excerpt.replace("ERROR : : error listing: ", "")
+    return excerpt
 
 
 class CredentialsService(CRUDService):
@@ -394,7 +435,7 @@ class CredentialsService(CRUDService):
             if proc.returncode == 0:
                 return {"valid": True}
             else:
-                return {"valid": False, "error": proc.stderr}
+                return {"valid": False, "error": proc.stderr, "excerpt": lsjson_error_excerpt(proc.stderr)}
 
     @accepts(Dict(
         "cloud_sync_credentials_create",
@@ -661,9 +702,9 @@ class CloudSyncService(CRUDService):
         List("exclude", default=[], items=[Str("path", empty=False)]),
         Dict("attributes", additional_attrs=True, required=True),
         Bool("snapshot", default=False),
-        Str("pre_script", default=""),
-        Str("post_script", default=""),
-        Str("args", default=""),
+        Str("pre_script", default="", max_length=None),
+        Str("post_script", default="", max_length=None),
+        Str("args", default="", max_length=None),
         Bool("enabled", default=True),
         register=True,
     ))
@@ -756,6 +797,7 @@ class CloudSyncService(CRUDService):
         Deletes cloud_sync entry `id`.
         """
         await self.middleware.call("datastore.delete", "tasks.cloudsync", id)
+        await self.middleware.call("alert.oneshot_delete", "CloudSyncTaskFailed", id)
         await self.middleware.call("service.restart", "cron")
 
     @accepts(Int("credentials_id"))
@@ -821,7 +863,7 @@ class CloudSyncService(CRUDService):
             if proc.returncode == 0:
                 return json.loads(proc.stdout)
             else:
-                raise CallError(proc.stderr)
+                raise CallError(proc.stderr, extra={"excerpt": lsjson_error_excerpt(proc.stderr)})
 
     @item_method
     @accepts(Int("id"))
@@ -851,13 +893,33 @@ class CloudSyncService(CRUDService):
             job.set_progress(0, f"Locking remote path {remote_path!r} for {directions[remote_direction]}")
             async with self.remote_fs_lock_manager.lock(f"{credentials['id']}/{remote_path}", remote_direction):
                 job.set_progress(0, "Starting")
-                alert_args = {"name": cloud_sync["description"] or f"#{cloud_sync['id']}"}
                 try:
                     await rclone(self.middleware, job, cloud_sync)
-                    await self.middleware.call("alert.oneshot_delete", "CloudSyncTaskFailed", alert_args)
+                    await self.middleware.call("alert.oneshot_delete", "CloudSyncTaskFailed", cloud_sync["id"])
                 except Exception:
-                    await self.middleware.call("alert.oneshot_create", "CloudSyncTaskFailed", alert_args)
+                    await self.middleware.call("alert.oneshot_create", "CloudSyncTaskFailed", {
+                        "id": cloud_sync["id"],
+                        "name": cloud_sync["description"],
+                    })
                     raise
+
+    @item_method
+    @accepts(Int("id"))
+    async def abort(self, id):
+        """
+        Aborts cloud sync task.
+        """
+
+        cloud_sync = await self._get_instance(id)
+
+        if cloud_sync["job"] is None:
+            return False
+
+        if cloud_sync["job"]["state"] not in ["WAITING", "RUNNING"]:
+            return False
+
+        await self.middleware.call("core.job_abort", cloud_sync["job"]["id"])
+        return True
 
     @accepts()
     async def providers(self):
@@ -941,9 +1003,16 @@ class CloudSyncService(CRUDService):
         return schema
 
 
+remote_classes = []
+for module in load_modules(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.path.pardir,
+                                        "rclone", "remote")):
+    for cls in load_classes(module, BaseRcloneRemote, []):
+        remote_classes.append(cls)
+        for method_name in cls.extra_methods:
+            setattr(CloudSyncService, f"{cls.name.lower()}_{method_name}", getattr(cls, method_name))
+
+
 async def setup(middleware):
-    for module in load_modules(os.path.join(os.path.dirname(os.path.realpath(__file__)), os.path.pardir,
-                                            "rclone", "remote")):
-        for cls in load_classes(module, BaseRcloneRemote, []):
-            remote = cls(middleware)
-            REMOTES[remote.name] = remote
+    for cls in remote_classes:
+        remote = cls(middleware)
+        REMOTES[remote.name] = remote

@@ -10,8 +10,10 @@ import types
 
 from .client import ejson as json
 from .job import Job
+from .pipe import Pipes
 from .schema import Error as SchemaError
 from .service import CallError, ValidationError, ValidationErrors
+from .service_exception import adapt_exception, MatchNotFound
 
 
 async def authenticate(middleware, req):
@@ -29,7 +31,7 @@ async def authenticate(middleware, req):
             raise web.HTTPUnauthorized()
     except web.HTTPUnauthorized:
         raise
-    except Exception as e:
+    except Exception:
         raise web.HTTPUnauthorized()
 
 
@@ -52,8 +54,8 @@ class RESTfulAPI(object):
         for methodname, method in list((await self.middleware.call('core.get_methods')).items()):
             self._methods[methodname] = method
             self._methods_by_service[methodname.rsplit('.', 1)[0]][methodname] = method
-        for name, service in list((await self.middleware.call('core.get_services')).items()):
 
+        for name, service in list((await self.middleware.call('core.get_services')).items()):
             kwargs = {}
             blacklist_methods = []
             """
@@ -196,7 +198,7 @@ class OpenAPIResource(object):
                         'schema': {'type': 'string'},
                     },
                 ]
-            elif accepts:
+            elif accepts and not (operation == 'delete' and method['item_method'] and len(accepts) == 1):
                 opobject['requestBody'] = self._accepts_to_request(methodname, method, accepts)
 
             # For now we only accept `id` as an url parameters
@@ -441,7 +443,7 @@ class Resource(object):
                 val = None
             filters.append((field, op, val))
 
-        return [filters, options]
+        return [filters, options] if filters or options else []
 
     async def do(self, http_method, req, resp, **kwargs):
         assert http_method in ('delete', 'get', 'post', 'put')
@@ -459,7 +461,19 @@ class Resource(object):
         if get_method_args is not None:
             method_args = get_method_args(req, resp, **kwargs)
         else:
-            if http_method in ('post', 'put'):
+            method_args = []
+            if http_method == 'get' and method['filterable']:
+                if self.parent and 'id' in kwargs:
+                    filterid = kwargs['id']
+                    if filterid.isdigit():
+                        filterid = int(filterid)
+                    method_args = [[('id', '=', filterid)], {'get': True}]
+                else:
+                    method_args = self._filterable_args(req)
+
+            if not method_args:
+                # RFC 7231 specifies that a GET request can accept a payload body
+                # This means that all the http methods now ( delete, get, post, put ) accept a payload body
                 try:
                     text = await req.text()
                     if not text:
@@ -467,7 +481,12 @@ class Resource(object):
                     else:
                         data = await req.json()
                         params = self.__method_params.get(methodname)
-                        if not params or len(params) == 1:
+                        if not params and http_method in ('get', 'delete') and not data:
+                            # This will happen when the request body contains empty dict "{}"
+                            # Keeping compatibility with how we used to accept the above case, this
+                            # makes sure that existing client implementations are not affected
+                            method_args = []
+                        elif not params or len(params) == 1:
                             method_args = [data]
                         else:
                             if not isinstance(data, dict):
@@ -498,16 +517,6 @@ class Resource(object):
                         'message': str(e),
                     })
                     return resp
-            elif http_method == 'get' and method['filterable']:
-                if self.parent and 'id' in kwargs:
-                    filterid = kwargs['id']
-                    if filterid.isdigit():
-                        filterid = int(filterid)
-                    method_args = [[('id', '=', filterid)], {'get': True}]
-                else:
-                    method_args = self._filterable_args(req)
-            else:
-                method_args = []
 
         """
         If the method is marked `item_method` then the first argument
@@ -516,10 +525,16 @@ class Resource(object):
         if method.get('item_method') is True:
             method_args.insert(0, kwargs['id'])
 
+        method_kwargs = {}
+        download_pipe = None
+        if method['downloadable']:
+            download_pipe = self.middleware.pipe()
+            method_kwargs['pipes'] = Pipes(output=download_pipe)
+
         try:
-            result = await self.middleware.call(methodname, *method_args)
+            result = await self.middleware.call(methodname, *method_args, **method_kwargs)
         except CallError as e:
-            resp = web.Response(status=400)
+            resp = web.Response(status=422)
             result = {
                 'message': e.errmsg,
                 'errno': e.errno,
@@ -534,12 +549,48 @@ class Resource(object):
                     'errno': errno,
                 })
             resp = web.Response(status=422)
+
         except Exception as e:
-            resp = web.Response(status=500)
-            result = {
-                'message': str(e),
-                'traceback': ''.join(traceback.format_exc()),
-            }
+            adapted = adapt_exception(e)
+            if adapted:
+                resp = web.Response(status=422)
+                result = {
+                    'message': adapted.errmsg,
+                    'errno': adapted.errno,
+                }
+            else:
+                if isinstance(e, (MatchNotFound,)):
+                    resp = web.Response(status=404)
+                    result = {
+                        'message': str(e),
+                    }
+                else:
+                    resp = web.Response(status=500)
+                    result = {
+                        'message': str(e),
+                        'traceback': ''.join(traceback.format_exc()),
+                    }
+
+        if download_pipe is not None:
+            resp = web.StreamResponse(status=200, reason='OK', headers={
+                'Content-Type': 'application/octet-stream',
+                'Transfer-Encoding': 'chunked',
+            })
+            await resp.prepare(req)
+
+            loop = asyncio.get_event_loop()
+
+            def do_copy():
+                while True:
+                    read = download_pipe.r.read(1048576)
+                    if read == b'':
+                        break
+                    asyncio.run_coroutine_threadsafe(resp.write(read), loop=loop).result()
+
+            await self.middleware.run_in_thread(do_copy)
+
+            await resp.drain()
+            return resp
 
         if isinstance(result, types.GeneratorType):
             result = list(result)

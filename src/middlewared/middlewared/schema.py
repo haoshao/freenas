@@ -57,7 +57,7 @@ class EnumMixin(object):
 class Attribute(object):
 
     def __init__(self, name, title=None, description=None, required=False, null=False, empty=True, private=False,
-                 validators=None, register=False, **kwargs):
+                 validators=None, register=False, hidden=False, **kwargs):
         self.name = name
         self.has_default = 'default' in kwargs
         self.default = kwargs.pop('default', None)
@@ -69,6 +69,7 @@ class Attribute(object):
         self.description = description
         self.validators = validators or []
         self.register = register
+        self.hidden = hidden
 
     def clean(self, value):
         if value is None and self.null is False:
@@ -141,6 +142,7 @@ class Any(Attribute):
                 {'type': 'array'},
             ],
             'title': self.title,
+            'nullable': True if self.null else False
         }
         if self.description:
             schema['description'] = self.description
@@ -152,6 +154,11 @@ class Any(Attribute):
 
 
 class Str(EnumMixin, Attribute):
+
+    def __init__(self, *args, **kwargs):
+        # Sqlite limits ( (2 ** 31) - 1 ) for storing text - https://www.sqlite.org/limits.html
+        self.max_length = kwargs.pop('max_length', 1024) or (2 ** 31) - 1
+        super().__init__(*args, **kwargs)
 
     def clean(self, value):
         value = super(Str, self).clean(value)
@@ -174,13 +181,26 @@ class Str(EnumMixin, Attribute):
             if self.has_default:
                 schema['default'] = self.default
             schema['_required_'] = self.required
-        if not self.required:
+        if self.null:
             schema['type'] = ['string', 'null']
         else:
             schema['type'] = 'string'
         if self.enum is not None:
             schema['enum'] = self.enum
         return schema
+
+    def validate(self, value):
+        if value is None:
+            return value
+
+        verrors = ValidationErrors()
+
+        if value and len(value) > self.max_length:
+            verrors.add(self.name, f'Value greater than {self.max_length} not allowed')
+
+        verrors.check()
+
+        return super().validate(value)
 
 
 class Path(Str):
@@ -323,6 +343,9 @@ class Time(Str):
             except TypeError:
                 raise ValueError('Time should be in 24 hour format like "18:00"')
 
+    def validate(self, value):
+        return super().validate(str(value))
+
 
 class UnixPerm(Str):
 
@@ -353,7 +376,7 @@ class Bool(Attribute):
 
     def to_json_schema(self, parent=None):
         schema = {
-            'type': ['boolean', 'null'] if not self.required else 'boolean',
+            'type': ['boolean', 'null'] if self.null else 'boolean',
         }
         if not parent:
             schema['title'] = self.title
@@ -379,7 +402,7 @@ class Int(EnumMixin, Attribute):
 
     def to_json_schema(self, parent=None):
         schema = {
-            'type': ['integer', 'null'] if not self.required else 'integer',
+            'type': ['integer', 'null'] if self.null else 'integer',
         }
         if not parent:
             schema['title'] = self.title
@@ -408,7 +431,7 @@ class Float(EnumMixin, Attribute):
 
     def to_json_schema(self, parent=None):
         schema = {
-            'type': ['float', 'null'] if not self.required else 'float',
+            'type': ['float', 'null'] if self.null else 'float',
         }
         if not parent:
             schema['title'] = self.verbose
@@ -484,7 +507,7 @@ class List(EnumMixin, Attribute):
             if self.has_default:
                 schema['default'] = self.default
             schema['_required_'] = self.required
-        if self.required:
+        if self.null:
             schema['type'] = ['array', 'null']
         else:
             schema['type'] = 'array'
@@ -804,6 +827,7 @@ class Patch(object):
                 attr = schema.attrs[patch['name']]
                 if 'method' in patch:
                     patch['method'](attr)
+                    schema.attrs[patch['name']] = attr.resolve(schemas)
             elif operation == 'attr':
                 for key, val in list(patch.items()):
                     setattr(schema, key, val)
@@ -849,6 +873,13 @@ def resolve_methods(schemas, to_resolve):
 
 
 def accepts(*schema):
+    further_only_hidden = False
+    for i in schema:
+        if getattr(i, 'hidden', False):
+            further_only_hidden = True
+        elif further_only_hidden:
+            raise ValueError("You can't have non-hidden arguments after hidden")
+
     def wrap(f):
         # Make sure number of schemas is same as method argument
         args_index = 1

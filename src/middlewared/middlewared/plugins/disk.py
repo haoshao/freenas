@@ -3,6 +3,7 @@ import base64
 from collections import defaultdict
 from datetime import datetime, timedelta
 import errno
+import functools
 import glob
 import os
 import re
@@ -13,10 +14,11 @@ import tempfile
 from xml.etree import ElementTree
 
 from bsd import geom, getswapinfo
+import cam
 from lxml import etree
 
 from middlewared.common.camcontrol import camcontrol_list
-from middlewared.common.smart.smartctl import get_smartctl_args
+from middlewared.common.smart.smartctl import SMARTCTL_POWERMODES, get_smartctl_args
 from middlewared.schema import accepts, Bool, Dict, Int, List, Str
 from middlewared.service import job, private, CallError, CRUDService
 from middlewared.utils import Popen, run
@@ -45,6 +47,42 @@ RAWTYPE = {
     'freebsd-zfs': '516e7cba-6ecf-11d6-8ff8-00022d09712b',
     'freebsd-swap': '516e7cb5-6ecf-11d6-8ff8-00022d09712b',
 }
+
+
+def get_temperature(stdout):
+    # ataprint.cpp
+
+    data = {}
+    for s in re.findall(r'^((190|194) .+)', stdout, re.M):
+        s = s[0].split()
+        try:
+            data[s[1]] = int(s[9])
+        except (IndexError, ValueError):
+            pass
+    for k in ['Temperature_Celsius', 'Temperature_Internal', 'Drive_Temperature',
+              'Temperature_Case', 'Case_Temperature', 'Airflow_Temperature_Cel']:
+        if k in data:
+            return data[k]
+
+    reg = re.search(r'194\s+Temperature_Celsius[^\n]*', stdout, re.M)
+    if reg:
+        return int(reg.group(0).split()[9])
+
+    # nvmeprint.cpp
+
+    reg = re.search(r'Temperature:\s+([0-9]+) Celsius', stdout, re.M)
+    if reg:
+        return int(reg.group(1))
+
+    reg = re.search(r'Temperature Sensor [0-9]+:\s+([0-9]+) Celsius', stdout, re.M)
+    if reg:
+        return int(reg.group(1))
+
+    # scsiprint.cpp
+
+    reg = re.search(r'Current Drive Temperature:\s+([0-9]+) C', stdout, re.M)
+    if reg:
+        return int(reg.group(1))
 
 
 class DiskService(CRUDService):
@@ -171,7 +209,7 @@ class DiskService(CRUDService):
 
         if any(
                 new[key] != old[key]
-                for key in ['togglesmart', 'smartoptions', 'critical', 'difference', 'informational']
+                for key in ['togglesmart', 'smartoptions', 'hddstandby', 'critical', 'difference', 'informational']
         ):
 
             if new['togglesmart']:
@@ -301,6 +339,7 @@ class DiskService(CRUDService):
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             if cp.stderr or not os.path.exists(f'/dev/{dev}.eli'):
                 raise CallError(f'Unable to geli attach {dev}: {cp.stderr.decode()}')
+            self.__geli_notify_passphrase(passphrase)
         else:
             self.logger.debug(f'{dev} already attached')
 
@@ -358,10 +397,11 @@ class DiskService(CRUDService):
                     continue
                 try:
                     self.geli_attach_single(
-                        name, pool['encryptkey_path'], tf.name, skip_existing=True,
+                        name, pool['encryptkey_path'], tf.name if passphrase else None, skip_existing=True,
                     )
                 except Exception as e:
-                    if str(e).find('Wrong key') != -1:
+                    # "Missing -p flag" happens when using passphrase on a pool without passphrase
+                    if any(s in str(e) for s in ('Wrong key', 'Missing -p flag')):
                         return False
         return True
 
@@ -376,6 +416,8 @@ class DiskService(CRUDService):
         ) + [dev], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if cp.stderr:
             raise CallError(f'Unable to set passphrase on {dev}: {cp.stderr.decode()}')
+
+        self.__geli_notify_passphrase(passphrase)
 
     @private
     def geli_delkey(self, dev, slot=GELI_KEY_SLOT, force=False):
@@ -557,6 +599,13 @@ class DiskService(CRUDService):
                     self.logger.warn('Failed to clear %s: %s', dev, e)
         return failed
 
+    def __geli_notify_passphrase(self, passphrase):
+        if passphrase:
+            with open(passphrase) as f:
+                self.middleware.call_hook_sync('disk.post_geli_passphrase', f.read())
+        else:
+            self.middleware.call_hook_sync('disk.post_geli_passphrase', None)
+
     @private
     def encrypt(self, devname, keypath, passphrase=None):
         self.__geli_setmetadata(devname, keypath, passphrase)
@@ -565,7 +614,7 @@ class DiskService(CRUDService):
 
     @accepts(
         List('devices', items=[Str('device')]),
-        Str('passphrase', null=True, private=True),
+        Str('passphrase', null=True, default=None, private=True),
     )
     @job(pipes=['input'])
     def decrypt(self, job, devices, passphrase=None):
@@ -638,27 +687,20 @@ class DiskService(CRUDService):
         return partitions
 
     async def __get_smartctl_args(self, devname):
-        camcontrol = await camcontrol_list()
-        if devname not in camcontrol:
-            return
-
-        args = await get_smartctl_args(devname, camcontrol[devname])
-        if args is None:
-            return
-
-        return args
+        devices = await camcontrol_list()
+        return await get_smartctl_args(self.middleware, devices, devname)
 
     @private
     async def toggle_smart_off(self, devname):
         args = await self.__get_smartctl_args(devname)
         if args:
-            await run('/usr/local/sbin/smartctl', '--smart=off', *args, check=False)
+            await run('smartctl', '--smart=off', *args, check=False)
 
     @private
     async def toggle_smart_on(self, devname):
         args = await self.__get_smartctl_args(devname)
         if args:
-            await run('/usr/local/sbin/smartctl', '--smart=on', *args, check=False)
+            await run('smartctl', '--smart=on', *args, check=False)
 
     @private
     async def serial_from_device(self, name):
@@ -676,6 +718,56 @@ class DiskService(CRUDService):
             return g.provider.config['ident']
 
         return None
+
+    @accepts(
+        List('names', items=[Str('name')]),
+        Str('powermode', enum=SMARTCTL_POWERMODES, default=SMARTCTL_POWERMODES[0]),
+        Dict('smartctl_args', additional_attrs=True, hidden=True),
+    )
+    async def temperatures(self, names, powermode, smartctl_args):
+        """
+        Returns temperatures for a list of device `names` using specified S.M.A.R.T. `powermode`.
+        """
+
+        if not smartctl_args:
+            smartctl_args = await self.smartctl_args_for_devices(names)
+
+        smartctl_args = {k: ['-n', powermode.lower()] + v for k, v in smartctl_args.items() if v is not None}
+
+        available_names = list(smartctl_args.keys())
+
+        result = dict(zip(
+            available_names,
+            await asyncio_map(lambda name: self.__get_temperature(name, smartctl_args[name]), available_names, 8),
+        ))
+
+        for name in names:
+            result.setdefault(name, None)
+
+        return result
+
+    @private
+    async def smartctl_args_for_devices(self, names):
+        devices = await camcontrol_list()
+        return dict(zip(
+            names,
+            await asyncio_map(functools.partial(get_smartctl_args, self.middleware, devices), names, 8)
+        ))
+
+    async def __get_temperature(self, disk, smartctl_args):
+        if disk.startswith('da'):
+            try:
+                return await self.middleware.run_in_thread(lambda: cam.CamDevice(disk).get_temperature())
+            except Exception:
+                pass
+
+        cp = await run(['smartctl', '-a'] + smartctl_args, check=False, stderr=subprocess.STDOUT,
+                       encoding='utf8', errors='ignore')
+        if (cp.returncode & 0b11) != 0:
+            self.logger.trace('Failed to run smartctl for %r (%r): %s', disk, smartctl_args, cp.stdout)
+            return None
+
+        return get_temperature(cp.stdout)
 
     @private
     @accepts(Str('name'))
@@ -955,7 +1047,7 @@ class DiskService(CRUDService):
             # If for some reason disk is not identified as a system disk
             # mark it to expire.
             if name not in sys_disks and not disk['disk_expiretime']:
-                    disk['disk_expiretime'] = datetime.utcnow() + timedelta(days=DISK_EXPIRECACHE_DAYS)
+                disk['disk_expiretime'] = datetime.utcnow() + timedelta(days=DISK_EXPIRECACHE_DAYS)
             # Do not issue unnecessary updates, they are slow on HA systems and cause severe boot delays
             # when lots of drives are present
             if disk != original_disk:
@@ -1394,15 +1486,15 @@ class DiskService(CRUDService):
                 part_a, part_b = part_ab
 
                 if not dumpdev:
-                    dumpdev = await dempdev_configure(part_a)
+                    dumpdev = await dumpdev_configure(part_a)
+                name = new_swap_name()
+                if name is None:
+                    # Which means maximum has been reached and we can stop
+                    break
                 try:
-                    name = new_swap_name()
-                    if name is None:
-                        # Which means maximum has been reached and we can stop
-                        break
                     await run('gmirror', 'create', name, part_a, part_b)
                 except subprocess.CalledProcessError as e:
-                    self.logger.warn('Failed to create gmirror %s: %s', name, e.stderr.decode())
+                    self.logger.warning('Failed to create gmirror %s: %s', name, e.stderr.decode())
                     continue
                 swap_devices.append(f'mirror/{name}')
                 # Add remaining partitions to unused list
@@ -1412,13 +1504,22 @@ class DiskService(CRUDService):
         # partition as a swap device
         if not swap_devices and unused_partitions:
             if not dumpdev:
-                dumpdev = await dempdev_configure(unused_partitions[0])
+                dumpdev = await dumpdev_configure(unused_partitions[0])
             swap_devices.append(unused_partitions[0])
 
         for name in swap_devices:
             if not os.path.exists(f'/dev/{name}.eli'):
-                await run('geli', 'onetime', name)
-            await run('swapon', f'/dev/{name}.eli', check=False)
+                try:
+                    await run('geli', 'onetime', name)
+                except subprocess.CalledProcessError as e:
+                    self.logger.warning('Failed to encrypt swap partition %s: %s', name, e.stderr.decode())
+                    continue
+
+            try:
+                await run('swapon', f'/dev/{name}.eli')
+            except subprocess.CalledProcessError as e:
+                self.logger.warning('Failed to activate swap partition %s: %s', name, e.stderr.decode())
+                continue
 
         return swap_devices
 
@@ -1756,7 +1857,7 @@ def new_swap_name():
             return name
 
 
-async def dempdev_configure(name):
+async def dumpdev_configure(name):
     # Configure dumpdev on first swap device
     if not os.path.exists('/dev/dumpdev'):
         try:

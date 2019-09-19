@@ -200,6 +200,11 @@ class CloudSync(Model):
             jid = c.call('cloudsync.sync', self.id)
         return jid
 
+    def stop(self):
+        with client as c:
+            jid = c.call('cloudsync.abort', self.id)
+        return jid
+
 
 class CronJob(Model):
     cron_user = UserField(
@@ -459,7 +464,7 @@ class Rsync(Model):
     )
     rsync_quiet = models.BooleanField(
         verbose_name=_("Quiet"),
-        help_text=_("Suppress non-error messages"),
+        help_text=_("Suppress alerts and logs of rsync task."),
         default=False,
     )
     rsync_preserveperm = models.BooleanField(

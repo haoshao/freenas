@@ -17,12 +17,14 @@ log = logging.getLogger("update_check_alertmod")
 class HasUpdateAlertClass(AlertClass):
     category = AlertCategory.SYSTEM
     level = AlertLevel.INFO
-    title = "New Update Available"
-    text = "A new update is available. Apply it with System -> Update."
+    title = "Update Available"
+    text = "A system update is available. Go to System -> Update to download and apply the update."
 
 
 class HasUpdateAlertSource(ThreadedAlertSource):
     schedule = IntervalSchedule(timedelta(hours=1))
+
+    run_on_backup_node = False
 
     def check_sync(self):
         try:

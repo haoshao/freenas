@@ -1,7 +1,9 @@
 from middlewared.schema import Bool, Dict, Int, List, Ref, Str, accepts
 from middlewared.service import CallError, ConfigService, ValidationErrors, job, periodic, private
+from middlewared.validators import Email
 
 from datetime import datetime, timedelta
+from email.header import Header
 from email.message import Message
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -94,14 +96,16 @@ class MailService(ConfigService):
 
     @accepts(Dict(
         'mail_update',
-        Str('fromemail'),
+        Str('fromemail', validators=[Email()]),
+        Str('fromname'),
         Str('outgoingserver'),
         Int('port'),
         Str('security', enum=['PLAIN', 'SSL', 'TLS']),
         Bool('smtp'),
         Str('user'),
         Str('pass', private=True),
-        update=True
+        register=True,
+        update=True,
     ))
     async def do_update(self, data):
         """
@@ -156,10 +160,10 @@ class MailService(ConfigService):
         return verrors
 
     @accepts(Dict(
-        'mail-message',
+        'mail_message',
         Str('subject', required=True),
-        Str('text', required=True),
-        Str('html'),
+        Str('text', required=True, max_length=None),
+        Str('html', max_length=None),
         List('to', items=[Str('email')]),
         List('cc', items=[Str('email')]),
         Int('interval', null=True),
@@ -168,16 +172,10 @@ class MailService(ConfigService):
         Bool('attachments', default=False),
         Bool('queue', default=True),
         Dict('extra_headers', additional_attrs=True),
-        register=True
-    ), Dict(
-        'mail-config',
-        Str('pass', private=True),
-        additional_attrs=True,
-        null=True,
-        register=True
-    ))
+        register=True,
+    ), Ref('mail_update'))
     @job(pipes=['input'], check_pipes=False)
-    def send(self, job, message, config=None):
+    def send(self, job, message, config):
         """
         Sends mail using configured mail settings.
 
@@ -228,10 +226,28 @@ class MailService(ConfigService):
 
         return self.send_raw(job, message, config)
 
-    @accepts(Ref('mail-message'), Ref('mail-config'))
+    @accepts(Ref('mail_message'), Ref('mail_update'))
     @job(pipes=['input'], check_pipes=False)
     @private
-    def send_raw(self, job, message, config=None):
+    def send_raw(self, job, message, config):
+        config = dict(self.middleware.call_sync('mail.config'), **config)
+
+        if config['fromname']:
+            from_addr = Header(config['fromname'], 'utf-8')
+            try:
+                config['fromemail'].encode('ascii')
+            except UnicodeEncodeError:
+                from_addr.append(f'<{config["fromemail"]}>', 'utf-8')
+            else:
+                from_addr.append(f'<{config["fromemail"]}>', 'ascii')
+        else:
+            try:
+                config['fromemail'].encode('ascii')
+            except UnicodeEncodeError:
+                from_addr = Header(config['fromemail'], 'utf-8')
+            else:
+                from_addr = Header(config['fromemail'], 'ascii')
+
         interval = message.get('interval')
         if interval is None:
             interval = timedelta()
@@ -259,8 +275,6 @@ class MailService(ConfigService):
             else:
                 raise CallError('This message was already sent in the given interval')
 
-        if not config:
-            config = self.middleware.call_sync('mail.config')
         verrors = self.__password_verify(config['pass'], 'mail-config.pass')
         if verrors:
             raise verrors
@@ -317,7 +331,7 @@ class MailService(ConfigService):
 
         msg['Subject'] = message['subject']
 
-        msg['From'] = config['fromemail']
+        msg['From'] = from_addr
         msg['To'] = ', '.join(to)
         if message.get('cc'):
             msg['Cc'] = ', '.join(message.get('cc'))
@@ -347,7 +361,7 @@ class MailService(ConfigService):
             #    server.connect()
             headers = '\n'.join([f'{k}: {v}' for k, v in msg._headers])
             syslog.syslog(f"sending mail to {', '.join(to)}\n{headers}")
-            server.sendmail(config['fromemail'], to, msg.as_string())
+            server.sendmail(from_addr.encode(), to, msg.as_string())
             server.quit()
         except Exception as e:
             # Don't spam syslog with these messages. They should only end up in the

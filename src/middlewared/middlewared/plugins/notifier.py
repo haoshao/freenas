@@ -2,7 +2,6 @@ from middlewared.service import CallError, Service
 
 import errno
 import os
-import subprocess
 import sys
 import logging
 
@@ -18,14 +17,8 @@ if not apps.ready:
 from django.conf import settings
 from freenasUI import choices
 from freenasUI import common as fcommon
-from freenasUI.common.freenasldap import (
-    FreeNAS_LDAP,
-    FLAGS_DBINIT,
-)
-from freenasUI.common.freenasusers import FreeNAS_User, FreeNAS_Group
 from freenasUI.middleware import zfs
 from freenasUI.middleware.notifier import notifier
-from middlewared.utils import Popen
 
 
 logger = logging.getLogger('plugins.notifier')
@@ -80,82 +73,45 @@ class NotifierService(Service):
 
         return serialize(rv)
 
-    def directoryservice(self, name):
-        """Temporary wrapper to serialize DS connectors"""
-        if name == 'AD':
-            smb = self.middleware.call_sync('smb.config')
-            ad = self.middleware.call_sync('activedirectory.config')
-            data = {
-                'netbiosname': smb['netbiosname'],
-                'domainname': ad['domainname'],
-                'use_default_domain': ad['use_default_domain'],
-                'ad_idmap_backend': ad['idmap_backend'],
-                'ds_type': 1,
-                'krb_realm': ad['kerberos_realm']['krb_realm'],
-                'workgroups': smb['workgroup'],
-            }
-            return data
-        elif name == 'LDAP':
-            ds = FreeNAS_LDAP(flags=FLAGS_DBINIT)
-        else:
-            raise ValueError('Unknown ds name {0}'.format(name))
-        data = {}
-        for i in (
-            'netbiosname', 'keytab_file', 'keytab_principal', 'domainname',
-            'use_default_domain', 'dchost', 'basedn', 'binddn', 'bindpw',
-            'userdn', 'groupdn', 'ssl', 'certfile', 'id',
-            'ad_idmap_backend', 'ds_type',
-            'krb_realm', 'krbname', 'kpwdname',
-            'krb_kdc', 'krb_admin_server', 'krb_kpasswd_server',
-            'workgroups'
-        ):
-            if hasattr(ds, i):
-                data[i] = getattr(ds, i)
-        return data
-
-    def get_user_object(self, username):
+    async def get_user_object(self, username):
         user = False
         try:
-            user = FreeNAS_User(username)
+            u = await self.middleware.call('dscache.get_uncached_user', username)
+            user = [
+                u['pw_name'],
+                '',
+                u['pw_uid'],
+                u['pw_gid'],
+                u['pw_gecos'],
+                u['pw_dir'],
+                u['pw_shell']
+            ]
         except Exception:
             pass
         return user
 
-    def get_group_object(self, groupname):
+    async def get_group_object(self, groupname):
         group = False
         try:
-            group = FreeNAS_Group(groupname)
+            g = await self.middleware.call('dscache.get_uncached_group', groupname)
+            group = [g['gr_name'], '', g['gr_gid'], g['gr_mem']]
         except Exception:
             pass
         return group
 
     def ldap_status(self):
-        ret = False
-        try:
-            f = FreeNAS_LDAP(flags=FLAGS_DBINIT)
-            f.open()
-            if f.isOpen():
-                ret = True
-            f.close()
-        except Exception as e:
-            pass
-
-        return ret
+        return self.middleware.call_sync('ldap.started')
 
     def ad_status(self):
         return self.middleware.call_sync('activedirectory.started')
 
     def ds_get_idmap_object(self, ds_type, id, idmap_backend):
         data = self.middleware.call_sync('idmap.get_idmap_legacy', ds_type, idmap_backend)
-        return data 
+        return data
 
     async def ds_clearcache(self):
         """Temporary call to rebuild DS cache"""
-        await Popen(
-            '/usr/local/bin/python /usr/local/www/freenasUI/tools/cachetool.py expire && '
-            '/usr/local/bin/python /usr/local/www/freenasUI/tools/cachetool.py fill',
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True
-        )
+        await self.middleware.call('dscache.refresh')
 
     def choices(self, name, args=None):
         """Temporary wrapper to get to UI choices"""

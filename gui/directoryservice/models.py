@@ -807,11 +807,6 @@ class ActiveDirectory(DirectoryServiceBase):
         verbose_name=_("Verbose logging"),
         default=False
     )
-    ad_unix_extensions = models.BooleanField(
-        verbose_name=_("UNIX extensions"),
-        help_text=_("Set this if your Active Directory has UNIX extensions."),
-        default=False
-    )
     ad_allow_trusted_doms = models.BooleanField(
         verbose_name=_("Allow Trusted Domains"),
         help_text=_("Set this if you want to allow Trusted Domains."),
@@ -1103,6 +1098,15 @@ class LDAP(DirectoryServiceBase):
         blank=True,
         null=True,
         limit_choices_to={'cert_certificate__isnull': False, 'cert_privatekey__isnull': False}
+    )
+    ldap_disable_freenas_cache = models.BooleanField(
+        verbose_name=_("Disable LDAP user/group cache"),
+        help_text=_(
+            "Set to disable caching LDAP users and groups in large LDAP environments. "
+            "When caching is disabled, LDAP users and groups do not appear in dropdown "
+            "menus, but are still accepted when manually entered."
+        ),
+        default=False
     )
     ldap_timeout = models.IntegerField(
         verbose_name=_("LDAP timeout"),

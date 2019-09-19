@@ -182,16 +182,6 @@ def UNIXCHARSET_CHOICES():
         return choices
 
 
-def KERBEROS_PRINCIPAL_CHOICES():
-    try:
-        with client as c:
-            principals = c.call('kerberos.keytab.kerberos_principal_choices')
-            principals.insert(0, '---------')
-            return [(principal, principal) for principal in principals]
-    except Exception:
-        return [('---------', '---------')]
-
-
 LOGLEVEL_CHOICES = (
     ('0', _('None')),
     ('1', _('Minimum')),
@@ -306,6 +296,11 @@ VLAN_PCP_CHOICES = (
     (7, _('Network control (highest)')),
 )
 
+ZFS_AclmodeChoices = (
+    ('passthrough', _('Passthrough')),
+    ('restricted', _('Restricted')),
+)
+
 ZFS_AtimeChoices = (
     ('inherit', _('Inherit')),
     ('on', _('On')),
@@ -394,8 +389,7 @@ class NICChoices(object):
         try:
             if (
                 os.environ.get('MIDDLEWARED_LOADING') != 'True' and
-                hasattr(notifier, 'failover_status') and
-                notifier().failover_licensed()
+                hasattr(notifier, 'failover_status')
             ):
                 for iface in notifier().failover_internal_interfaces():
                     if iface in self._NIClist:
@@ -897,9 +891,8 @@ SAMBA4_FOREST_LEVEL_CHOICES = (
 )
 
 SHARE_TYPE_CHOICES = (
-    ('unix', 'UNIX'),
-    ('windows', 'Windows'),
-    ('mac', 'Mac')
+    ('GENERIC', 'Generic'),
+    ('SMB', 'SMB'),
 )
 
 CASE_SENSITIVITY_CHOICES = (
@@ -1007,7 +1000,7 @@ class IDMAP_CHOICES(object):
 
         self.__idmap_modules_path = '/usr/local/lib/shared-modules/idmap'
         self.__idmap_modules = []
-        self.__idmap_exclude = {'passdb', 'hash'}
+        self.__idmap_exclude = {'passdb', 'hash', 'adex', 'tdb2'}
 
         if os.path.exists(self.__idmap_modules_path):
             self.__idmap_modules.extend(

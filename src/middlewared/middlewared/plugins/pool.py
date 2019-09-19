@@ -13,6 +13,7 @@ import tempfile
 import uuid
 
 import bsd
+import psutil
 
 from libzfs import ZFSException
 from middlewared.job import JobProgressBuffer
@@ -21,14 +22,18 @@ from middlewared.schema import (accepts, Attribute, Bool, Cron, Dict, EnumMixin,
 from middlewared.service import (
     ConfigService, filterable, item_method, job, private, CallError, CRUDService, ValidationErrors
 )
+from middlewared.service_exception import ValidationError
 from middlewared.utils import Popen, filter_list, run, start_daemon_thread
 from middlewared.utils.asyncio_ import asyncio_map
+from middlewared.utils.shell import join_commandline
 from middlewared.validators import Range, Time
 
 logger = logging.getLogger(__name__)
 
 GELI_KEYPATH = '/data/geli'
 RE_DISKPART = re.compile(r'^([a-z]+\d+)(p\d+)?')
+RE_HISTORY_ZPOOL_SCRUB = re.compile(r'^([0-9\.\:\-]{19})\s+zpool scrub', re.MULTILINE)
+RE_HISTORY_ZPOOL_CREATE = re.compile(r'^([0-9\.\:\-]{19})\s+zpool create', re.MULTILINE)
 ZPOOL_CACHE_FILE = '/data/zfs/zpool.cache'
 ZPOOL_KILLCACHE = '/data/zfs/killcache'
 
@@ -52,7 +57,13 @@ class Inheritable(EnumMixin, Attribute):
 
     def to_json_schema(self, parent=None):
         schema = self.value.to_json_schema(parent)
-        schema['anyOf'] = [{'type': schema.pop('type')}, {'type': 'string', 'enum': ['INHERIT']}]
+        type_schema = schema.pop('type')
+        schema['nullable'] = 'null' in type_schema
+        if schema['nullable']:
+            type_schema.remove('null')
+            if len(type_schema) == 1:
+                type_schema = type_schema[0]
+        schema['anyOf'] = [{'type': type_schema}, {'type': 'string', 'enum': ['INHERIT']}]
         return schema
 
 
@@ -119,6 +130,10 @@ async def mount(device, path, fs_type, fs_options, options):
         ))
     else:
         return True
+
+
+class ScrubError(CallError):
+    pass
 
 
 class PoolResilverService(ConfigService):
@@ -297,8 +312,8 @@ class PoolService(CRUDService):
             await self.middleware.call('zfs.pool.scrub', pool['name'], action)
         )
 
-    @accepts()
-    async def filesystem_choices(self):
+    @accepts(List('types', items=[Str('type', enum=['FILESYSTEM', 'VOLUME'])], default=['FILESYSTEM', 'VOLUME']))
+    async def filesystem_choices(self, types):
         """
         Returns all available datasets, except system datasets.
 
@@ -313,6 +328,16 @@ class PoolService(CRUDService):
                 "method": "pool.filesystem_choices",
                 "params": []
             }
+
+          Get only filesystems (exclude volumes).
+
+            :::javascript
+            {
+                "id": "6841f242-840a-11e6-a437-00e04d680384",
+                "msg": "method",
+                "method": "pool.filesystem_choices",
+                "params": [["FILESYSTEM"]]
+            }
         """
         vol_names = [vol['name'] for vol in (await self.query())]
         return [
@@ -320,8 +345,10 @@ class PoolService(CRUDService):
                 'zfs.dataset.query',
                 [
                     ('name', 'rnin', '.system'),
-                    ('pool', 'in', vol_names)
-                ]
+                    ('pool', 'in', vol_names),
+                    ('type', 'in', types),
+                ],
+                {'extra': {'retrieve_properties': False}},
             )
         ]
 
@@ -883,6 +910,9 @@ class PoolService(CRUDService):
         into their respectives vdevs.
         """
 
+        # Make sure all SED disks are unlocked
+        await self.middleware.call('disk.sed_unlock_all')
+
         swapgb = (await self.middleware.call('system.advanced.config'))['swapondrive']
 
         enc_disks = []
@@ -1271,6 +1301,12 @@ class PoolService(CRUDService):
 
         `label` is the vdev guid or device name.
 
+        Error codes:
+
+            EZFS_NOSPC(2032): out of space to remove a device
+            EZFS_NODEVICE(2017): no such device in pool
+            EZFS_NOREPLICAS(2019): no valid replicas
+
         .. examples(websocket)::
 
           Remove ZFS device.
@@ -1497,6 +1533,7 @@ class PoolService(CRUDService):
             'nfs': 'NFS',
             'webdav': 'WebDAV',
             'jails': 'Jails/Plugins',
+            'vms': 'Virtual Machines',
         }
         return svcs
 
@@ -1567,8 +1604,8 @@ class PoolService(CRUDService):
         if options['recoverykey']:
             job.check_pipe("input")
             with tempfile.NamedTemporaryFile(mode='wb+', dir='/tmp/') as f:
-                f.write(job.pipes.input.r.read())
-                f.flush()
+                await self.middleware.run_in_thread(shutil.copyfileobj, job.pipes.input.r, f)
+                await self.middleware.run_in_thread(f.flush)
                 failed = await self.middleware.call('disk.geli_attach', pool, None, f.name)
         else:
             failed = await self.middleware.call('disk.geli_attach', pool, options['passphrase'])
@@ -1602,6 +1639,18 @@ class PoolService(CRUDService):
         ])
         if 'jails' in options['services_restart']:
             await self.middleware.call('core.bulk', 'jail.rc_action', [['RESTART']])
+        if 'vms' in options['services_restart']:
+            vms = (await self.middleware.call(
+                'vm.query', [('autostart', '=', True)])
+            )
+            pool_name = pool['name']
+            for vm in vms:
+                for device in vm['devices']:
+                    path = device['attributes'].get('path', '')
+                    if f'/dev/zvol/{pool_name}/' in path or \
+                            f'/mnt/{pool_name}/' in path:
+                        await self.middleware.call('vm.stop', vm['id'])
+                        await self.middleware.call('vm.start', vm['id'])
 
         await self.middleware.call_hook('pool.post_unlock', pool=pool)
 
@@ -1664,8 +1713,8 @@ class PoolService(CRUDService):
         return True
 
     @item_method
-    @accepts(Int('id'))
-    async def download_encryption_key(self, oid):
+    @accepts(Int('id'), Str('filename', default='geli.key'))
+    async def download_encryption_key(self, oid, filename):
         """
         Download encryption key for a given pool `id`.
         """
@@ -1677,7 +1726,7 @@ class PoolService(CRUDService):
             'core.download',
             'filesystem.get',
             [os.path.join(self.GELI_KEYPATH, f"{pool['encryptkey']}.key")],
-            'geli.key'
+            filename,
         )
         return url
 
@@ -1750,6 +1799,7 @@ class PoolService(CRUDService):
         Str('guid', required=True),
         Str('name'),
         Str('passphrase', private=True),
+        Bool('enable_attachments'),
     ))
     @job(lock='import_pool', pipes=['input'], check_pipes=False)
     async def import_pool(self, job, data):
@@ -1758,8 +1808,11 @@ class PoolService(CRUDService):
 
         If a `name` is specified the pool will be imported using that new name.
 
-        `devices` is required while importing an encrypted pool. In that case this method needs to
+        `passphrase` is required while importing an encrypted pool. In that case this method needs to
         be called using /_upload/ endpoint with the encryption key.
+
+        If `enable_attachments` is set to true, attachments that were disabled during pool export will be
+        re-enabled.
 
         Errors:
             ENOENT - Pool not found
@@ -1848,6 +1901,17 @@ class PoolService(CRUDService):
             if passfile:
                 os.unlink(passfile)
             raise
+
+        key = f'pool:{pool["name"]}:enable_on_import'
+        if await self.middleware.call('keyvalue.has_key', key):
+            for name, ids in (await self.middleware.call('keyvalue.get', key)).items():
+                for delegate in PoolDatasetService.attachment_delegates:
+                    if delegate.name == name:
+                        attachments = await delegate.query(pool['path'], False)
+                        attachments = [attachment for attachment in attachments if attachment['id'] in ids]
+                        if attachments:
+                            await delegate.toggle(attachments, True)
+            await self.middleware.call('keyvalue.delete', key)
 
         await self.middleware.call('service.reload', 'disk')
         await self.middleware.call_hook('pool.post_import_pool', pool)
@@ -2007,6 +2071,7 @@ class PoolService(CRUDService):
         Dict(
             'options',
             Bool('cascade', default=False),
+            Bool('restart_services', default=False),
             Bool('destroy', default=False),
         ),
     )
@@ -2015,7 +2080,8 @@ class PoolService(CRUDService):
         """
         Export pool of `id`.
 
-        `cascade` will remove all attachments of the given pool (`pool.attachments`).
+        `cascade` will delete all attachments of the given pool (`pool.attachments`).
+        `restart_services` will restart services that have open files on given pool.
         `destroy` will also PERMANENTLY destroy the pool/data.
 
         .. examples(websocket)::
@@ -2035,21 +2101,52 @@ class PoolService(CRUDService):
         """
         pool = await self._get_instance(oid)
 
-        job.set_progress(5, 'Retrieving pool attachments')
-        attachments = await self.__attachments(pool)
-        if options['cascade']:
-            job.set_progress(10, 'Deleting pool attachments')
-            await self.__delete_attachments(attachments, pool)
+        pool_count = await self.middleware.call('pool.query', [], {'count': True})
+        is_freenas = await self.middleware.call('system.is_freenas')
+        if (
+            pool_count == 1 and not is_freenas and
+            await self.middleware.call('failover.licensed') and
+            not (await self.middleware.call('failover.config'))['disabled']
+        ):
+            raise CallError('Disable failover before exporting last pool on system.')
 
-        job.set_progress(20, 'Stopping VMs using this pool (if any)')
-        # If there is any guest vm attached to this volume, we stop them
-        await self.middleware.call('vm.stop_by_pool', pool['name'], True)
+        enable_on_import_key = f'pool:{pool["name"]}:enable_on_import'
+        enable_on_import = {}
+        if not options['cascade']:
+            if await self.middleware.call('keyvalue.has_key', enable_on_import_key):
+                enable_on_import = await self.middleware.call('keyvalue.get', enable_on_import_key)
 
-        job.set_progress(30, 'Stopping jails using this pool (if any)')
-        activated_pool = await self.middleware.call('jail.get_activated_pool')
-        if activated_pool == pool['name']:
-            for jail_host in attachments['jails']:
-                await self.middleware.call('jail.stop', jail_host)
+        for i, delegate in enumerate(PoolDatasetService.attachment_delegates):
+            job.set_progress(
+                i, f'{"Deleting" if options["cascade"] else "Disabling"} pool attachments: {delegate.title}')
+
+            attachments = await delegate.query(pool['path'], True)
+            if attachments:
+                if options["cascade"]:
+                    await delegate.delete(attachments)
+                else:
+                    await delegate.toggle(attachments, False)
+                    enable_on_import[delegate.name] = list(
+                        set(enable_on_import.get(delegate.name, [])) |
+                        {attachment['id'] for attachment in attachments}
+                    )
+
+        if enable_on_import:
+            await self.middleware.call('keyvalue.set', enable_on_import_key, enable_on_import)
+        else:
+            await self.middleware.call('keyvalue.delete', enable_on_import_key)
+
+        job.set_progress(20, 'Terminating processes that are using this pool')
+        try:
+            await self.middleware.call('pool.dataset.kill_processes', pool['name'],
+                                       options.get('restart_services', False))
+        except ValidationError as e:
+            if e.errno == errno.ENOENT:
+                # Dataset might not exist (e.g. pool is not decrypted), this is not an error
+                pass
+            else:
+                raise
+        await self.middleware.call('iscsi.global.terminate_luns_for_pool', pool['name'])
 
         job.set_progress(30, 'Removing pool disks from swap')
         disks = [i async for i in await self.middleware.call('pool.get_disks')]
@@ -2116,89 +2213,22 @@ class PoolService(CRUDService):
     @accepts(Int('id'))
     async def attachments(self, oid):
         """
-        Return a dict composed by the name of services and ids of each item
-        dependent of this pool.
+        Return a list of services dependent of this pool.
 
         Responsible for telling the user whether there is a related
         share, asking for confirmation.
         """
         pool = await self._get_instance(oid)
-        return await self.__attachments(pool)
+        return await self.middleware.call('pool.dataset.attachments', pool['name'])
 
-    async def __attachments(self, pool):
-        attachments = {
-            'afp': [],
-            'iscsi_extents': [],
-            'jails': [],
-            'nfs': [],
-            'replication': [],
-            'smb': [],
-            'snaptask': [],
-            'vm_devices': [],
-        }
-
-        for smb in await self.middleware.call('sharing.smb.query'):
-            if smb['path'] == pool['path'] or smb['path'].startswith(pool['path'] + '/'):
-                attachments['smb'].append(smb['id'])
-
-        for afp in await self.middleware.call('sharing.afp.query'):
-            if afp['path'] == pool['path'] or afp['path'].startswith(pool['path'] + '/'):
-                attachments['afp'].append(afp['id'])
-
-        for nfs in await self.middleware.call('sharing.nfs.query'):
-            for path in nfs['paths']:
-                if (
-                    (path == pool['path'] or path.startswith(pool['path'] + '/')) and
-                    nfs['id'] not in attachments['nfs']
-                ):
-                    attachments['nfs'].append(nfs['id'])
-
-        for extent in await self.middleware.call('iscsi.extent.query', [('type', '=', 'DISK')]):
-            if extent['path'].startswith(f'zvol/{pool["name"]}/'):
-                attachments['iscsi_extents'].append(extent['id'])
-
-        for vm_attached in await self.middleware.call('vm.stop_by_pool', pool['name']):
-            attachments['vm_devices'].append(vm_attached['device_id'])
-
-        for repl in await self.middleware.call('replication.query'):
-            if any(
-                source_dataset == pool['name'] or source_dataset.startswith(pool['name'] + '/')
-                for source_dataset in repl['source_datasets']
-            ):
-                attachments['replication'].append(repl['id'])
-
-        for snap in await self.middleware.call('pool.snapshottask.query'):
-            if (
-                snap['dataset'] == pool['name'] or
-                snap['dataset'].startswith(pool['name'] + '/')
-            ):
-                attachments['snaptask'].append(snap['id'])
-
-        activated_pool = await self.middleware.call('jail.get_activated_pool')
-        if activated_pool == pool['name']:
-            for j in await self.middleware.call('jail.query', [('state', '=', 'up')]):
-                attachments['jails'].append(j['host_hostuuid'])
-
-        return attachments
-
-    async def __delete_attachments(self, attachments, pool):
-        # TODO: use a hook and move delete/stop to each plugin
-        for name, service in (
-            ('smb', 'sharing.smb.delete'),
-            ('afp', 'sharing.afp.delete'),
-            ('nfs', 'sharing.nfs.delete'),
-            ('iscsi_extents', 'iscsi.extent.delete'),
-            ('snaptask', 'pool.snapshottask.delete'),
-        ):
-            for aid in attachments[name]:
-                await self.middleware.call(service, aid)
-
-        for name, datastore in (
-            ('replication', 'storage.replication'),
-            ('vm_devices', 'vm.device'),
-        ):
-            for aid in attachments[name]:
-                await self.middleware.call('datastore.delete', datastore, aid)
+    @item_method
+    @accepts(Int('id'))
+    async def processes(self, oid):
+        """
+        Returns a list of running processes using this pool.
+        """
+        pool = await self._get_instance(oid)
+        return await self.middleware.call('pool.dataset.processes', pool['name'])
 
     @staticmethod
     def __get_dev_and_disk(topology):
@@ -2335,11 +2365,11 @@ class PoolService(CRUDService):
                             'altroot': '/mnt',
                             'cachefile': 'none',
                         }, True, zpool_cache_saved if os.path.exists(zpool_cache_saved) else None)
-                    except Exception as e:
-                        # If the pool exists but failed to import skip this one
-                        if not isinstance(e, CallError) or e.errno != errno.ENOENT:
-                            self.logger.error('Failed to import %s', pool['name'], exc_info=True)
-                            continue
+                    except Exception:
+                        # Importing a pool may fail because of out of date guid database entry
+                        # or because bad cachefile. Try again using the pool name and wihout
+                        # the cachefile
+                        self.logger.error('Failed to import %s', pool['name'], exc_info=True)
                     else:
                         imported = True
                 if not imported:
@@ -2383,24 +2413,6 @@ class PoolService(CRUDService):
 
         if os.path.exists(ZPOOL_CACHE_FILE):
             shutil.copy(ZPOOL_CACHE_FILE, zpool_cache_saved)
-
-        job.set_progress(90, 'Ensuring correct ACL mode of datasets')
-
-        # Use subprocess instead of zfs plugin for speed reasons
-        cp = subprocess.run(
-            'zfs list -t filesystem -H -o name,aclmode,mountpoint | '
-            'awk \'$2 != "restricted" {print $0}\'',
-            shell=True, capture_output=True, text=True, check=False,
-        )
-        for line in cp.stdout.strip().split('\n'):
-            line = line.strip()
-            if not line:
-                continue
-            dataset, aclmode, mountpoint = line.split('\t')
-            if os.path.exists(f'{mountpoint}/.windows'):
-                self.middleware.call_sync('zfs.dataset.update', dataset, {'properties': {
-                    'aclmode': {'value': 'restricted'},
-                }})
 
         # Now that pools have been imported we are ready to configure system dataset,
         # collectd and syslogd which may depend on them.
@@ -2447,6 +2459,8 @@ class PoolService(CRUDService):
 
 class PoolDatasetService(CRUDService):
 
+    attachment_delegates = []
+
     class Config:
         namespace = 'pool.dataset'
 
@@ -2461,7 +2475,9 @@ class PoolDatasetService(CRUDService):
             if len(f) == 3:
                 if f[0] in ('id', 'name', 'pool', 'type'):
                     zfsfilters.append(f)
-        datasets = self.middleware.call_sync('zfs.dataset.query', zfsfilters, None)
+        datasets = self.middleware.call_sync(
+            'zfs.dataset.query', zfsfilters, {'extra': (options or {}).get('extra', {})}
+        )
         return filter_list(self.__transform(datasets), filters, options)
 
     def __transform(self, datasets):
@@ -2477,6 +2493,7 @@ class PoolDatasetService(CRUDService):
                 ('org.freenas:refquota_warning', 'refquota_warning', None),
                 ('org.freenas:refquota_critical', 'refquota_critical', None),
                 ('dedup', 'deduplication', str.upper),
+                ('aclmode', None, str.upper),
                 ('atime', None, str.upper),
                 ('casesensitivity', None, str.upper),
                 ('exec', None, str.upper),
@@ -2503,13 +2520,6 @@ class PoolDatasetService(CRUDService):
                 if method:
                     dataset[i]['value'] = method(dataset[i]['value'])
             del dataset['properties']
-
-            if dataset['type'] == 'FILESYSTEM':
-                dataset['share_type'] = self.middleware.call_sync(
-                    'notifier.get_dataset_share_type', dataset['name'],
-                ).upper()
-            else:
-                dataset['share_type'] = None
 
             rv = []
             for child in dataset['children']:
@@ -2558,7 +2568,8 @@ class PoolDatasetService(CRUDService):
             '512', '1K', '2K', '4K', '8K', '16K', '32K', '64K', '128K', '256K', '512K', '1024K',
         ]),
         Str('casesensitivity', enum=['SENSITIVE', 'INSENSITIVE', 'MIXED']),
-        Str('share_type', enum=['UNIX', 'WINDOWS', 'MAC']),
+        Str('aclmode', enum=['PASSTHROUGH', 'RESTRICTED']),
+        Str('share_type', default='GENERIC', enum=['GENERIC', 'SMB']),
         register=True,
     ))
     async def do_create(self, data):
@@ -2595,11 +2606,16 @@ class PoolDatasetService(CRUDService):
         if os.path.exists(mountpoint):
             verrors.add('pool_dataset_create.name', f'Path {mountpoint} already exists')
 
+        if data['share_type'] == 'SMB':
+            data['casesensitivity'] = 'INSENSITIVE'
+            data['aclmode'] = 'RESTRICTED'
+
         if verrors:
             raise verrors
 
         props = {}
         for i, real_name, transform in (
+            ('aclmode', None, str.lower),
             ('atime', None, str.lower),
             ('casesensitivity', None, str.lower),
             ('comments', 'org.freenas:description', None),
@@ -2638,10 +2654,8 @@ class PoolDatasetService(CRUDService):
 
         await self.middleware.call('zfs.dataset.mount', data['name'])
 
-        if data['type'] == 'FILESYSTEM':
-            await self.middleware.call(
-                'notifier.change_dataset_share_type', data['name'], data.get('share_type', 'UNIX').lower()
-            )
+        if data['type'] == 'FILESYSTEM' and data['share_type'] == 'SMB':
+            await self.middleware.call('pool.dataset.permission', data['id'], {'mode': None})
 
         return await self._get_instance(data['id'])
 
@@ -2655,6 +2669,7 @@ class PoolDatasetService(CRUDService):
         ('rm', {'name': 'name'}),
         ('rm', {'name': 'type'}),
         ('rm', {'name': 'casesensitivity'}),  # Its a readonly attribute
+        ('rm', {'name': 'share_type'}),  # This is something we should only do at create time
         ('rm', {'name': 'sparse'}),  # Create time only attribute
         ('rm', {'name': 'volblocksize'}),  # Create time only attribute
         ('edit', _add_inherit('atime')),
@@ -2710,6 +2725,7 @@ class PoolDatasetService(CRUDService):
 
         props = {}
         for i, real_name, transform, inheritable in (
+            ('aclmode', None, str.lower, True),
             ('atime', None, str.lower, True),
             ('comments', 'org.freenas:description', None, False),
             ('sync', None, str.lower, True),
@@ -2740,11 +2756,7 @@ class PoolDatasetService(CRUDService):
 
         rv = await self.middleware.call('zfs.dataset.update', id, {'properties': props})
 
-        if data['type'] == 'FILESYSTEM' and 'share_type' in data:
-            await self.middleware.call(
-                'notifier.change_dataset_share_type', id, data['share_type'].lower()
-            )
-        elif data['type'] == 'VOLUME' and 'volsize' in data:
+        if data['type'] == 'VOLUME' and 'volsize' in data:
             if await self.middleware.call('iscsi.extent.query', [('path', '=', f'zvol/{id}')]):
                 await self._service_change('iscsitarget', 'reload')
 
@@ -2775,7 +2787,7 @@ class PoolDatasetService(CRUDService):
                 verrors.add(f'{schema}.volsize', 'This field is required for VOLUME')
 
             for i in (
-                'atime', 'casesensitivity', 'quota', 'refquota', 'recordsize', 'share_type',
+                'aclmode', 'atime', 'casesensitivity', 'quota', 'refquota', 'recordsize',
             ):
                 if i in data:
                     verrors.add(f'{schema}.{i}', 'This field is not valid for VOLUME')
@@ -2836,12 +2848,18 @@ class PoolDatasetService(CRUDService):
                 "params": ["tank/myuser"]
             }
         """
-        iscsi_target_extents = await self.middleware.call('iscsi.extent.query', [
-            ['type', '=', 'DISK'],
-            ['path', '=', f'zvol/{id}']
-        ])
-        if iscsi_target_extents:
-            raise CallError("This volume is in use by iSCSI extent, please remove it first.")
+
+        if not options['recursive'] and await self.middleware.call('zfs.dataset.query', [['id', '^', f'{id}/']]):
+            raise CallError(f'Failed to delete dataset: cannot destroy {id!r}: filesystem has children',
+                            errno.ENOTEMPTY)
+
+        dataset = await self._get_instance(id)
+        path = self.__attachments_path(dataset)
+        if path:
+            for delegate in self.attachment_delegates:
+                attachments = await delegate.query(path, True)
+                if attachments:
+                    await delegate.delete(attachments)
 
         return await self.middleware.call('zfs.dataset.delete', id, {
             'force': options['force'],
@@ -2867,15 +2885,77 @@ class PoolDatasetService(CRUDService):
             'pool_dataset_permission',
             Str('user'),
             Str('group'),
-            UnixPerm('mode'),
-            Str('acl', enum=['UNIX', 'MAC', 'WINDOWS'], default='UNIX'),
-            Bool('recursive', default=False),
+            UnixPerm('mode', null=True),
+            List(
+                'acl',
+                items=[
+                    Dict(
+                        'aclentry',
+                        Str('tag', enum=['owner@', 'group@', 'everyone@', 'USER', 'GROUP']),
+                        Int('id', null=True),
+                        Str('type', enum=['ALLOW', 'DENY']),
+                        Dict(
+                            'perms',
+                            Bool('READ_DATA'),
+                            Bool('WRITE_DATA'),
+                            Bool('APPEND_DATA'),
+                            Bool('READ_NAMED_ATTRS'),
+                            Bool('WRITE_NAMED_ATTRS'),
+                            Bool('EXECUTE'),
+                            Bool('DELETE_CHILD'),
+                            Bool('READ_ATTRIBUTES'),
+                            Bool('WRITE_ATTRIBUTES'),
+                            Bool('DELETE'),
+                            Bool('READ_ACL'),
+                            Bool('WRITE_ACL'),
+                            Bool('WRITE_OWNER'),
+                            Bool('SYNCHRONIZE'),
+                            Str('BASIC', enum=['FULL_CONTROL', 'MODIFY', 'READ', 'TRAVERSE']),
+                        ),
+                        Dict(
+                            'flags',
+                            Bool('FILE_INHERIT'),
+                            Bool('DIRECTORY_INHERIT'),
+                            Bool('NO_PROPAGATE_INHERIT'),
+                            Bool('INHERIT_ONLY'),
+                            Bool('INHERITED'),
+                            Str('BASIC', enum=['INHERIT', 'NOINHERIT']),
+                        ),
+                    )
+                ],
+                default=[
+                    {
+                        "tag": "owner@",
+                        "id": None,
+                        "type": "ALLOW",
+                        "perms": {"BASIC": "FULL_CONTROL"},
+                        "flags": {"BASIC": "INHERIT"}
+                    },
+                    {
+                        "tag": "group@",
+                        "id": None,
+                        "type": "ALLOW",
+                        "perms": {"BASIC": "FULL_CONTROL"},
+                        "flags": {"BASIC": "INHERIT"}
+                    }
+                ],
+            ),
+            Dict(
+                'options',
+                Bool('stripacl', default=False),
+                Bool('recursive', default=False),
+                Bool('traverse', default=False),
+            )
+
         ),
     )
     @item_method
     async def permission(self, id, data):
         """
-        Set permissions for a dataset `id`.
+        Set permissions for a dataset `id`. Permissions may be specified as
+        either a posix `mode` or an nfsv4 `acl`. Setting mode will fail if the
+        dataset has an existing nfsv4 acl. In this case, the option `stripacl`
+        must be set to `True`.
 
         .. examples(websocket)::
 
@@ -2888,29 +2968,92 @@ class PoolDatasetService(CRUDService):
                 "method": "pool.dataset.permission",
                 "params": ["tank/myuser", {
                     "user": "myuser",
+                    "acl": [],
                     "group": "wheel",
                     "mode": "755",
-                    "recursive": true,
+                    "options": {"recursive": true, "stripacl": true},
                 }]
             }
+
         """
         path = (await self._get_instance(id))['mountpoint']
         user = data.get('user', None)
         group = data.get('group', None)
+        uid = gid = -1
         mode = data.get('mode', None)
-        recursive = data.get('recursive', False)
-        acl = data['acl']
-        verrors = ValidationErrors()
+        options = data.get('options', {})
+        acl = data.get('acl', [])
 
-        if (acl == 'UNIX' or acl == 'MAC') and mode is None:
+        verrors = ValidationErrors()
+        if user:
+            try:
+                uid = (await self.middleware.call('dscache.get_uncached_user', user))['pw_uid']
+            except Exception as e:
+                verrors.add('pool_dataset_permission.user', str(e))
+
+        if group:
+            try:
+                gid = (await self.middleware.call('dscache.get_uncached_group', group))['gr_gid']
+            except Exception as e:
+                verrors.add('pool_dataset_permission.group', str(e))
+
+        if acl and mode:
             verrors.add('pool_dataset_permission.mode',
-                        'This field is required')
+                        'setting mode and ACL simultaneously is not permitted.')
+
+        if acl and options['stripacl']:
+            verrors.add('pool_dataset_permissions.acl',
+                        'Simultaneously setting and removing ACL is not permitted.')
+
+        if mode and not options['stripacl']:
+            if not await self.middleware.call('filesystem.acl_is_trivial', path):
+                verrors.add('pool_dataset_permissions.options',
+                            f'{path} has an extended ACL. The option "stripacl" must be selected.')
 
         if verrors:
             raise verrors
 
-        await self.middleware.call('notifier.mp_change_permission', path, user,
-                                   group, mode, recursive, acl.lower())
+        if not acl and mode is None and not options['stripacl']:
+            """
+            Neither an ACL, mode, or removing the existing ACL are
+            specified in `data`. Perform a simple chown.
+            """
+            options.pop('stripacl', None)
+            await self.middleware.call('filesystem.chown', {
+                'path': path,
+                'uid': uid,
+                'gid': gid,
+                'options': options
+            })
+
+        elif acl:
+            await self.middleware.call('filesystem.setacl', {
+                'path': path,
+                'dacl': acl,
+                'uid': uid,
+                'gid': gid,
+                'options': options
+            })
+
+        elif mode or options['stripacl']:
+            """
+            `setperm` performs one of two possible actions. If
+            `mode` is not set, but `stripacl` is specified, then
+            the existing ACL on the file is converted in place via
+            `acl_strip_np()`. This preserves the existing posix mode
+            while removing any extended ACL entries.
+
+            If `mode` is set, then the ACL is removed from the file
+            and the new `mode` is applied.
+            """
+            await self.middleware.call('filesystem.setperm', {
+                'path': path,
+                'mode': mode,
+                'uid': uid,
+                'gid': gid,
+                'options': options
+            })
+
         return data
 
     @accepts(Str('pool'))
@@ -2949,6 +3092,137 @@ class PoolDatasetService(CRUDService):
             if num > numdisks:
                 numdisks = num
         return '%dK' % 2 ** ((numdisks * 4) - 1).bit_length()
+
+    @item_method
+    @accepts(Str('id', required=True))
+    async def attachments(self, oid):
+        """
+        Return a list of services dependent of this dataset.
+
+        Responsible for telling the user whether there is a related
+        share, asking for confirmation.
+
+        Example return value:
+        [
+          {
+            "type": "NFS Share",
+            "service": "nfs",
+            "attachments": ["/mnt/tank/work"]
+          }
+        ]
+        """
+        result = []
+        dataset = await self._get_instance(oid)
+        path = self.__attachments_path(dataset)
+        if path:
+            for delegate in self.attachment_delegates:
+                attachments = {"type": delegate.title, "service": delegate.service, "attachments": []}
+                for attachment in await delegate.query(path, True):
+                    attachments["attachments"].append(await delegate.get_attachment_name(attachment))
+                if attachments["attachments"]:
+                    result.append(attachments)
+        return result
+
+    def __attachments_path(self, dataset):
+        if dataset['type'] == 'FILESYSTEM':
+            return dataset['mountpoint']
+
+        if dataset['type'] == 'VOLUME':
+            return os.path.join('/mnt', dataset['name'])
+
+    @item_method
+    @accepts(Str('id', required=True))
+    async def processes(self, oid):
+        """
+        Return a list of processes using this dataset.
+
+        Example return value:
+
+        [
+          {
+            "pid": 2520,
+            "name": "smbd",
+            "service": "cifs"
+          },
+          {
+            "pid": 97778,
+            "name": "minio",
+            "cmdline": "/usr/local/bin/minio -C /usr/local/etc/minio server --address=0.0.0.0:9000 --quiet /mnt/tank/wk"
+          }
+        ]
+        """
+        result = []
+        dataset = await self._get_instance(oid)
+        path = self.__attachments_path(dataset)
+        zvol_path = f"/dev/zvol/{dataset['name']}"
+        if path:
+            lsof = await run('lsof',
+                             '-F', 'pcn',       # Output format parseable by `parse_lsof`
+                             '-l', '-n', '-P',  # Inhibits login name, hostname and port number conversion
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False, encoding='utf8')
+            for pid, name in parse_lsof(lsof.stdout, [path, zvol_path]):
+                service = await self.middleware.call('service.identify_process', name)
+                if service:
+                    result.append({
+                        "pid": pid,
+                        "name": name,
+                        "service": service,
+                    })
+                else:
+                    try:
+                        cmdline = await self.middleware.run_in_thread(
+                            lambda: psutil.Process(pid).cmdline()
+                        )
+                    except psutil.NoSuchProcess:
+                        pass
+                    else:
+                        result.append({
+                            "pid": pid,
+                            "name": name,
+                            "cmdline": join_commandline(cmdline),
+                        })
+
+        return result
+
+    @private
+    async def kill_processes(self, oid, restart_services, max_tries=5):
+        manually_restart_services = []
+        for process in await self.middleware.call('pool.dataset.processes', oid):
+            if process.get("service") is not None:
+                manually_restart_services.append(process["service"])
+        if manually_restart_services and not restart_services:
+            raise CallError('Some services have open files and need to be restarted', errno.EBUSY, {
+                'code': 'services_restart',
+                'services': manually_restart_services,
+            })
+
+        for i in range(max_tries):
+            processes = await self.middleware.call('pool.dataset.processes', oid)
+            if not processes:
+                return
+
+            for process in processes:
+                if process.get("service") is not None:
+                    self.logger.info('Restarting service %r that holds dataset %r', process['service'], oid)
+                    await self.middleware.call('service.restart', process['service'])
+                else:
+                    self.logger.info('Killing process %r (%r) that holds dataset %r', process['pid'],
+                                     process['cmdline'], oid)
+                    await self.middleware.call('service.terminate_process', process['pid'])
+
+        processes = await self.middleware.call('pool.dataset.processes', oid)
+        if not processes:
+            return
+
+        self.logger.info('The following processes don\'t want to stop: %r', processes)
+        raise CallError('Unable to stop processes that have open files', errno.EBUSY, {
+            'code': 'unstoppable_processes',
+            'processes': processes,
+        })
+
+    @private
+    def register_attachment_delegate(self, delegate):
+        self.attachment_delegates.append(delegate)
 
 
 class PoolScrubService(CRUDService):
@@ -3116,6 +3390,92 @@ class PoolScrubService(CRUDService):
 
         await self.middleware.call('service.restart', 'cron')
         return response
+
+    @accepts(Str('name'), Int('threshold', default=35))
+    async def run(self, name, threshold):
+        """
+        Initiate a scrub of a pool `name` if last scrub was performed more than `threshold` days before.
+        """
+        await self.middleware.call('alert.oneshot_delete', 'ScrubNotStarted', name)
+        await self.middleware.call('alert.oneshot_delete', 'ScrubStarted', name)
+        try:
+            started = await self.__run(name, threshold)
+        except ScrubError as e:
+            await self.middleware.call('alert.oneshot_create', 'ScrubNotStarted', {
+                'pool': name,
+                'text': e.errmsg,
+            })
+        else:
+            if started:
+                await self.middleware.call('alert.oneshot_create', 'ScrubStarted', name)
+
+    async def __run(self, name, threshold):
+        if name == 'freenas-boot':
+            pool = await self.middleware.call('zfs.pool.query', [['name', '=', name]], {'get': True})
+        else:
+            if not await self.middleware.call('system.is_freenas'):
+                if await self.middleware.call('failover.status') == 'BACKUP':
+                    return
+
+            pool = await self.middleware.call('pool.query', [['name', '=', name]], {'get': True})
+            if pool['status'] == 'OFFLINE':
+                if not pool['is_decrypted']:
+                    raise ScrubError(f'Pool {name} is not decrypted, skipping scrub')
+                else:
+                    raise ScrubError(f'Pool {name} is offline, not running scrub')
+
+        if pool['scan']['state'] == 'SCANNING':
+            return False
+
+        history = (await run('zpool', 'history', name, encoding='utf-8')).stdout
+        for match in reversed(list(RE_HISTORY_ZPOOL_SCRUB.finditer(history))):
+            last_scrub = datetime.strptime(match.group(1), '%Y-%m-%d.%H:%M:%S')
+            break
+        else:
+            # creation time of the pool if no scrub was done
+            for match in RE_HISTORY_ZPOOL_CREATE.finditer(history):
+                last_scrub = datetime.strptime(match.group(1), '%Y-%m-%d.%H:%M:%S')
+                break
+            else:
+                logger.warning("Could not find last scrub of pool %r", name)
+                last_scrub = datetime.min
+
+        if (datetime.now() - last_scrub).total_seconds() < (threshold - 1) * 86400:
+            logger.debug("Pool %r last scrub %r", name, last_scrub)
+            return False
+
+        await self.middleware.call('zfs.pool.scrub', pool['name'])
+        return True
+
+
+def parse_lsof(lsof, dirs):
+    pids = {}
+
+    pid = None
+    command = None
+    for line in lsof.split("\n"):
+        if line.startswith("p"):
+            pid = None
+            command = None
+
+            try:
+                pid = int(line[1:])
+            except ValueError:
+                pass
+
+        if line.startswith("c"):
+            command = line[1:]
+
+        if line.startswith("f"):
+            pass
+
+        if line.startswith("n"):
+            path = line[1:]
+            if os.path.isabs(path) and any(os.path.commonpath([path, dir]) == dir for dir in dirs):
+                if pid is not None and command is not None:
+                    pids[pid] = command
+
+    return list(pids.items())
 
 
 async def devd_zfs_hook(middleware, data):

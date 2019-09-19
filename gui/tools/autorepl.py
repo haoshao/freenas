@@ -364,9 +364,21 @@ for replication in replication_tasks:
     sshproc = pipeopen('%s %s' % (sshcmd, rzfscmd))
     output, error = sshproc.communicate()
     remote_zfslist = {}
-    for i in re.sub(r'[ \t]+', ' ', output, flags=re.M).splitlines():
-        data = i.split()
-        remote_zfslist[data[0]] = {'readonly': data[1] == 'on'}
+    if sshproc.returncode:
+        log.debug("Unable to list properties for remote dataset %s: %s" % (
+            remotefs,
+            error
+        ))
+    else:
+        try:
+            for i in output.rstrip().split("\n"):
+                data = i.rsplit("\t", 1)
+                remote_zfslist[data[0]] = {'readonly': data[1] == 'on'}
+        except Exception:
+            log.debug("Unable to parse properties for remote dataset %s: %s" % (
+                remotefs,
+                output
+            ))
 
     # Attempt to create the remote dataset.  If it fails, we don't care at this point.
     rzfscmd = "zfs create -o readonly=on "
@@ -386,7 +398,7 @@ for replication in replication_tasks:
             if ds_full in remote_zfslist:
                 continue
             log.debug("ds = %s, remotefs = %s" % (ds, remotefs))
-            sshproc = pipeopen('%s %s %s' % (sshcmd, rzfscmd, ds_full), quiet=True)
+            sshproc = pipeopen('%s \'%s "%s"\'' % (sshcmd, rzfscmd, ds_full), quiet=True)
             output, error = sshproc.communicate()
             error = error.strip('\n').strip('\r').replace('WARNING: ENABLED NONE CIPHER', '')
             # Debugging code
@@ -404,7 +416,7 @@ for replication in replication_tasks:
         # We expect to see "on" in the output, or cannot open '%s': dataset does not exist
         # in the error.  To be safe, also check for children's readonly state.
         may_proceed = False
-        rzfscmd = '"zfs list -H -o readonly -t filesystem,volume -r %s"' % (remotefs_final)
+        rzfscmd = '"zfs list -H -o readonly -t filesystem,volume -r \'%s\'"' % (remotefs_final)
         sshproc = pipeopen('%s %s' % (sshcmd, rzfscmd))
         output, error = sshproc.communicate()
         error = error.strip('\n').strip('\r').replace('WARNING: ENABLED NONE CIPHER', '')

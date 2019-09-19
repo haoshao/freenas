@@ -3,16 +3,21 @@ import subprocess
 import threading
 import time
 from collections import defaultdict
+from copy import deepcopy
+from datetime import datetime
 
 from bsd import geom
 import libzfs
 
-from middlewared.alert.base import AlertCategory, AlertClass, AlertLevel, SimpleOneShotAlertClass
+from middlewared.alert.base import (
+    Alert, AlertCategory, AlertClass, AlertLevel, OneShotAlertClass, SimpleOneShotAlertClass
+)
 from middlewared.schema import Dict, List, Str, Bool, accepts
 from middlewared.service import (
     CallError, CRUDService, ValidationError, ValidationErrors, filterable, job,
 )
 from middlewared.utils import filter_list, filter_getattrs, start_daemon_thread
+from middlewared.validators import ReplicationSnapshotNamingSchema
 
 SCAN_THREADS = {}
 
@@ -133,7 +138,10 @@ class ZFSPoolService(CRUDService):
             with libzfs.ZFS() as zfs:
                 zfs.destroy(name, force=options['force'])
         except libzfs.ZFSException as e:
-            raise CallError(str(e))
+            errno_ = errno.EFAULT
+            if e.code == libzfs.Error.UMOUNTFAILED:
+                errno_ = errno.EBUSY
+            raise CallError(str(e), errno_)
 
     @accepts(Str('pool', required=True))
     def upgrade(self, pool):
@@ -230,14 +238,14 @@ class ZFSPoolService(CRUDService):
         except libzfs.ZFSException as e:
             raise CallError(str(e), e.code)
 
-    def __zfs_vdev_operation(self, name, label, op):
+    def __zfs_vdev_operation(self, name, label, op, *args):
         try:
             with libzfs.ZFS() as zfs:
                 pool = zfs.get(name)
                 target = find_vdev(pool, label)
                 if target is None:
                     raise CallError(f'Failed to find vdev for {label}', errno.EINVAL)
-                op(target)
+                op(target, *args)
         except libzfs.ZFSException as e:
             raise CallError(str(e), e.code)
 
@@ -255,12 +263,14 @@ class ZFSPoolService(CRUDService):
         """
         self.__zfs_vdev_operation(name, label, lambda target: target.offline())
 
-    @accepts(Str('pool'), Str('label'))
-    def online(self, name, label):
+    @accepts(
+        Str('pool'), Str('label'), Bool('expand', default=False)
+    )
+    def online(self, name, label, expand=False):
         """
         Online device `label` from the pool `pool`.
         """
-        self.__zfs_vdev_operation(name, label, lambda target: target.online())
+        self.__zfs_vdev_operation(name, label, lambda target, *args: target.online(*args), expand)
 
     @accepts(Str('pool'), Str('label'))
     def remove(self, name, label):
@@ -348,14 +358,6 @@ class ZFSPoolService(CRUDService):
             t.start()
             t.join()
 
-    def pools_with_paused_scrubs(self):
-        with libzfs.ZFS() as zfs:
-            return [
-                pool.name
-                for pool in zfs.pools
-                if pool.scrub.pause is not None
-            ]
-
     @accepts()
     def find_import(self):
         with libzfs.ZFS() as zfs:
@@ -418,50 +420,82 @@ class ZFSDatasetService(CRUDService):
         private = True
         process_pool = True
 
+    def flatten_datasets(self, datasets):
+        return sum([[deepcopy(ds)] + self.flatten_datasets(ds['children']) for ds in datasets], [])
+
     @filterable
     def query(self, filters=None, options=None):
-        # If we are only filtering by name, pool and type we can use
-        # zfs(8) which is much faster than py-libzfs
-        if (
-            options and set(options['select']).issubset({'name', 'pool', 'type'}) and
-            filter_getattrs(filters).issubset({'name', 'pool', 'type'})
-        ):
-            cp = subprocess.run([
-                'zfs', 'list', '-H', '-o', 'name,type', '-t', 'filesystem,volume',
-            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf8')
-            datasets = []
-            for i in cp.stdout.strip().split('\n'):
-                name, type_ = i.split('\t')
-                pool = name.split('/', 1)[0]
-                datasets.append({
-                    'name': name,
-                    'pool': pool,
-                    'type': type_.upper(),
-                })
-        else:
-            with libzfs.ZFS() as zfs:
-                # Handle `id` filter specially to avoiding getting all datasets
-                if filters and len(filters) == 1 and list(filters[0][:2]) == ['id', '=']:
-                    try:
-                        datasets = [zfs.get_dataset(filters[0][2]).__getstate__()]
-                    except libzfs.ZFSException:
-                        datasets = []
+        """
+        In `query-options` we can provide `extra` arguments which control which data should be retrieved
+        for a dataset.
+
+        `query-options.extra.top_level_properties` is a list of properties which we will like to include in the
+        top level dict of dataset. It defaults to adding only mountpoint key keeping legacy behavior. If none are
+        desired in top level dataset, an empty list should be passed else if null is specified it will add mountpoint
+        key to the top level dict if it's present in `query-options.extra.properties` or it's null as well.
+
+        `query-options.extra.properties` is a list of properties which should be retrieved. If null ( by default ),
+        it would retrieve all properties, if empty, it will retrieve no property ( `mountpoint` is special in this
+        case and is controlled by `query-options.extra.mountpoint` attribute ).
+
+        We provide 2 ways how zfs.dataset.query returns dataset's data. First is a flat structure ( default ), which
+        means that all the datasets in the system are returned as separate objects which also contain all the data
+        their is for their children. This retrieval type is slightly slower because of duplicates which exist in
+        each object.
+        Second type is hierarchical where only top level datasets are returned in the list and they contain all the
+        children there are for them in `children` key. This retrieval type is slightly faster.
+        These options are controlled by `query-options.extra.flat` attribute which defaults to true.
+
+        `query-options.extra.user_properties` controls if user defined properties of datasets should be retrieved
+        or not.
+
+        While we provide a way to exclude all properties from data retrieval, we introduce a single attribute
+        `query-options.extra.retrieve_properties` which if set to false will make sure that no property is retrieved
+        whatsoever and overrides any other property retrieval attribute.
+        """
+        options = options or {}
+        extra = options.get('extra', {}).copy()
+        top_level_props = None if extra.get('top_level_properties') is None else extra['top_level_properties'].copy()
+        props = extra.get('properties', None)
+        flat = extra.get('flat', True)
+        user_properties = extra.get('user_properties', True)
+        retrieve_properties = extra.get('retrieve_properties', True)
+        if not retrieve_properties:
+            # This is a short hand version where consumer can specify that they don't want any property to
+            # be retrieved
+            user_properties = False
+            props = []
+
+        with libzfs.ZFS() as zfs:
+            # Handle `id` filter specially to avoiding getting all datasets
+            if filters and len(filters) == 1 and list(filters[0][:2]) == ['id', '=']:
+                try:
+                    datasets = [zfs.get_dataset(filters[0][2]).__getstate__()]
+                except libzfs.ZFSException:
+                    datasets = []
+            else:
+                datasets = zfs.datasets_serialized(
+                    props=props, top_level_props=top_level_props, user_props=user_properties
+                )
+                if flat:
+                    datasets = self.flatten_datasets(datasets)
                 else:
-                    datasets = [i.__getstate__() for i in zfs.datasets]
+                    datasets = list(datasets)
+
         return filter_list(datasets, filters, options)
 
     def query_for_quota_alert(self):
-        with libzfs.ZFS() as zfs:
-            return [
-                {
-                    k: v.__getstate__()
-                    for k, v in i.properties.items()
-                    if k in ["name", "quota", "used", "refquota", "usedbydataset", "mounted", "mountpoint",
-                             "org.freenas:quota_warning", "org.freenas:quota_critical",
-                             "org.freenas:refquota_warning", "org.freenas:refquota_critical"]
-                }
-                for i in zfs.datasets
-            ]
+        return [
+            {
+                k: v for k, v in dataset['properties'].items()
+                if k in [
+                    "name", "quota", "used", "refquota", "usedbydataset", "mounted", "mountpoint",
+                    "org.freenas:quota_warning", "org.freenas:quota_critical",
+                    "org.freenas:refquota_warning", "org.freenas:refquota_critical"
+                ]
+            }
+            for dataset in self.query()
+        ]
 
     @accepts(Dict(
         'dataset_create',
@@ -571,7 +605,11 @@ class ZFSDatasetService(CRUDService):
             )
         except subprocess.CalledProcessError as e:
             self.logger.error('Failed to delete dataset', exc_info=True)
-            raise CallError(f'Failed to delete dataset: {e.stderr.strip()}')
+            error = e.stderr.strip()
+            errno_ = errno.EFAULT
+            if "Device busy" in error:
+                errno_ = errno.EBUSY
+            raise CallError(f'Failed to delete dataset: {error}', errno_)
 
     @accepts(Str('name'), Dict('options', Bool('recursive', default=False)))
     def mount(self, name, options):
@@ -585,6 +623,23 @@ class ZFSDatasetService(CRUDService):
         except libzfs.ZFSException as e:
             self.logger.error('Failed to mount dataset', exc_info=True)
             raise CallError(f'Failed to mount dataset: {e}')
+
+    @accepts(
+        Str('dataset'),
+        Dict(
+            'options',
+            Str('new_name', required=True, empty=False),
+            Bool('recursive', default=False)
+        )
+    )
+    def rename(self, name, options):
+        try:
+            with libzfs.ZFS() as zfs:
+                dataset = zfs.get_dataset(name)
+                dataset.rename(options['new_name'], recursive=options['recursive'])
+        except libzfs.ZFSException as e:
+            self.logger.error('Failed to rename dataset', exc_info=True)
+            raise CallError(f'Failed to rename dataset: {e}')
 
     def promote(self, name):
         try:
@@ -639,9 +694,12 @@ class ZFSSnapshot(CRUDService):
             )
             if cp.returncode != 0:
                 raise CallError(f'Failed to retrieve snapshots: {cp.stderr}')
+            stdout = cp.stdout.strip()
+            if not stdout:
+                return []
             snaps = [
                 {'name': i, 'pool': i.split('/', 1)[0]}
-                for i in cp.stdout.strip().split('\n')
+                for i in stdout.split('\n')
             ]
             if filters:
                 return filter_list(snaps, filters, options)
@@ -668,11 +726,12 @@ class ZFSSnapshot(CRUDService):
 
     @accepts(Dict(
         'snapshot_create',
-        Str('dataset'),
-        Str('name'),
-        Bool('recursive'),
+        Str('dataset', required=True, empty=False),
+        Str('name', empty=False),
+        Str('naming_schema', empty=False, validators=[ReplicationSnapshotNamingSchema()]),
+        Bool('recursive', default=False),
         Bool('vmware_sync', default=False),
-        Dict('properties', additional_attrs=True)
+        Dict('properties', additional_attrs=True),
     ))
     def do_create(self, data):
         """
@@ -682,13 +741,23 @@ class ZFSSnapshot(CRUDService):
             bool: True if succeed otherwise False.
         """
 
-        dataset = data.get('dataset', '')
-        name = data.get('name', '')
-        recursive = data.get('recursive', False)
-        properties = data.get('properties', None)
+        dataset = data['dataset']
+        recursive = data['recursive']
+        properties = data['properties']
 
-        if not dataset or not name:
-            return False
+        verrors = ValidationErrors()
+
+        if 'name' in data and 'naming_schema' in data:
+            verrors.add('snapshot_create.naming_schema', 'You can\'t specify name and naming schema at the same time')
+        elif 'name' in data:
+            name = data['name']
+        elif 'naming_schema' in data:
+            name = datetime.now().strftime(data['naming_schema'])
+        else:
+            verrors.add('snapshot_create.naming_schema', 'You must specify either name or naming schema')
+
+        if verrors:
+            raise verrors
 
         vmware_context = None
         if data['vmware_sync']:
@@ -847,6 +916,29 @@ class ScanWatch(object):
 
     def cancel(self):
         self._cancel.set()
+
+
+class ScrubNotStartedAlertClass(AlertClass, OneShotAlertClass):
+    category = AlertCategory.TASKS
+    level = AlertLevel.WARNING
+    title = "Scrub Failed to Start"
+    text = "%s."
+
+    async def create(self, args):
+        return Alert(self.__class__, args["text"], _key=args["pool"])
+
+    async def delete(self, alerts, query):
+        return list(filter(
+            lambda alert: alert.key != query,
+            alerts
+        ))
+
+
+class ScrubStartedAlertClass(AlertClass, SimpleOneShotAlertClass):
+    category = AlertCategory.TASKS
+    level = AlertLevel.INFO
+    title = "Scrub Started"
+    text = "Scrub of pool %r started."
 
 
 class ScrubFinishedAlertClass(AlertClass, SimpleOneShotAlertClass):

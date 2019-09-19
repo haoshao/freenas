@@ -25,25 +25,9 @@ def get_context(middleware):
     return context
 
 
-def asigra_config(middleware, context):
-    if context['is_freenas']:
-        return []
-
-    yield (
-        'dssystem_env="PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:'
-        '/root/bin"'
-    )
-    yield 'postgresql_user="pgsql"'
-
-    pgsql_path = middleware.call_sync('asigra.config')['filesystem']
-    if not os.path.exists(pgsql_path):
-        pgsql_path = '/usr/local/pgsql/data'
-    yield f'postgresql_data="{pgsql_path}"'
-
-
 def collectd_config(middleware, context):
     if context['is_freenas'] or context['failover_status'] != 'BACKUP':
-        yield 'collectd_enable="YES"'
+        yield 'collectd_daemon_enable="YES"'
         yield 'rrdcached_enable="YES"'
 
         rrdcached_flags = '-s www -l /var/run/rrdcached.sock -p /var/run/rrdcached.pid'
@@ -126,8 +110,6 @@ def services_config(middleware, context):
         'iscsitarget': ['ctld'],
         'lldp': ['ladvd'],
         's3': ['minio'],
-        'netdata': ['netdata'],
-        'nfs': ['nfs_server', 'rpc_lockd', 'rpc_statd', 'mountd', 'nfsd', 'rpcbind'],
         'rsync': ['rsyncd'],
         'snmp': ['snmpd', 'snmp_agent'],
         'ssh': ['openssh'],
@@ -139,8 +121,9 @@ def services_config(middleware, context):
         # These services are handled by HA script
         # smartd #76242
         mapping.update({
+            'netdata': ['netdata'],
+            'nfs': ['nfs_server', 'rpc_lockd', 'rpc_statd', 'mountd', 'nfsd', 'rpcbind'],
             'smartd': ['smartd_daemon'],
-            'asigra': ['dssystem', 'postgresql'],
         })
 
     for service in services:
@@ -208,41 +191,40 @@ def nfs_config(middleware, context):
     yield f'rpc_lockd_flags="{" ".join(lockd_flags)}"'
     yield f'mountd_flags="{" ".join(mountd_flags)}"'
 
-    enabled = middleware.call_sync(
-        'datastore.query', 'services.services', [
-            ('srv_service', '=', 'nfs'), ('srv_enable', '=', True),
-        ]
-    )
-    if not enabled:
-        return []
+    if context['failover_licensed'] is False:
+        enabled = middleware.call_sync(
+            'datastore.query', 'services.services', [
+                ('srv_service', '=', 'nfs'), ('srv_enable', '=', True),
+            ]
+        )
+    else:
+        enabled = False
 
     if nfs['v4']:
         yield 'nfsv4_server_enable="YES"'
 
-        gssd = 'NO'
         if nfs['v4_krb'] and middleware.call_sync('datastore.query', 'directoryservice.kerberoskeytab'):
-            gssd = 'YES'
+            if enabled:
+                yield f'gssd_enable="YES"'
 
             gc = middleware.call_sync("datastore.config", "network.globalconfiguration")
             if gc["gc_hostname_virtual"] and gc["gc_domain"]:
                 yield f'nfs_server_vhost="{gc["gc_hostname_virtual"]}.{gc["gc_domain"]}"'
 
-        yield f'gssd_enable="{gssd}"'
-
         if nfs['v4_v3owner']:
-            yield 'nfsuserd_enable="NO"'
             # Per RFC7530, sending NFSv3 style UID/GIDs across the wire is now allowed
             # You must have both of these sysctl's set to allow the desired functionality
             sysctl.filter('vfs.nfsd.enable_stringtouid')[0].value = 1
             sysctl.filter('vfs.nfs.enable_uidtostring')[0].value = 1
         else:
-            yield 'nfsuserd_enable="YES"'
+            if enabled:
+                yield 'nfsuserd_enable="YES"'
             sysctl.filter('vfs.nfsd.enable_stringtouid')[0].value = 0
             sysctl.filter('vfs.nfs.enable_uidtostring')[0].value = 0
     else:
-        yield 'nfsv4_server_enable="NO"'
         if nfs['userd_manage_gids']:
-            yield 'nfsuserd_enable="YES"'
+            if enabled:
+                yield 'nfsuserd_enable="YES"'
             yield 'nfsuserd_flags="-manage-gids"'
 
 
@@ -279,7 +261,6 @@ def nut_config(middleware, context):
     ups = middleware.call_sync('ups.config')
     if ups['mode'] == 'MASTER':
         yield 'nut_enable="YES"'
-        yield 'nut_upsshut="NO"'
         yield f'nut_upslog_ups="{ups["identifier"]}"'
     else:
         yield f'nut_upslog_ups="{ups["identifier"]}@{ups["remotehost"]}:{ups["remoteport"]}"'
@@ -345,7 +326,6 @@ def truenas_config(middleware, context):
         yield 'failover_enable="NO"'
     else:
         yield 'failover_enable="YES"'
-        yield 'pf_enable="YES"'
 
 
 def tunable_config(middleware, context):
@@ -426,7 +406,6 @@ def render(service, middleware):
     rcs = []
     for i in (
         services_config,
-        asigra_config,
         collectd_config,
         geli_config,
         host_config,

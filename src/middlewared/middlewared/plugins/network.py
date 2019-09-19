@@ -377,6 +377,15 @@ class InterfaceService(CRUDService):
             'mtu': None,
         }
 
+        if not is_freenas:
+            iface.update({
+                'failover_critical': False,
+                'failover_vhid': None,
+                'failover_group': None,
+                'failover_aliases': [],
+                'failover_virtual_aliases': [],
+            })
+
         config = configs.get(iface['name'])
         if not config:
             return iface
@@ -394,8 +403,6 @@ class InterfaceService(CRUDService):
                 'failover_critical': config['int_critical'],
                 'failover_vhid': config['int_vhid'],
                 'failover_group': config['int_group'],
-                'failover_aliases': [],
-                'failover_virtual_aliases': [],
             })
             if config['int_ipv4address_b']:
                 iface['failover_aliases'].append({
@@ -565,13 +572,27 @@ class InterfaceService(CRUDService):
         for i in self._original_datastores['laggmembers']:
             await self.middleware.call('datastore.insert', 'network.lagginterfacemembers', i)
 
+        self._original_datastores.clear()
+
     async def __check_failover_disabled(self):
         if await self.middleware.call('system.is_freenas'):
             return
-        if not await self.middleware.call('failover.licensed'):
+        if await self.middleware.call('failover.status') == 'SINGLE':
             return
         if not (await self.middleware.call('failover.config'))['disabled']:
             raise CallError('Disable failover before performing interfaces changes.')
+
+    async def __check_dhcp_or_aliases(self):
+        for iface in await self.middleware.call('interface.query'):
+            if iface['ipv4_dhcp'] or iface['ipv6_auto']:
+                break
+            if iface['aliases']:
+                break
+        else:
+            raise CallError(
+                'At least one interface configured with either IPv4 DHCP, IPv6 auto or a static IP'
+                ' is required.'
+            )
 
     @accepts()
     async def has_pending_changes(self):
@@ -585,6 +606,9 @@ class InterfaceService(CRUDService):
         """
         Rollback pending interfaces changes.
         """
+        if self._rollback_timer:
+            self._rollback_timer.cancel()
+        self._rollback_timer = None
         await self.__check_failover_disabled()
         await self.__restore_datastores()
         await self.sync()
@@ -607,8 +631,12 @@ class InterfaceService(CRUDService):
         """
         Returns wether or not we are waiting user to checkin the applied network changes
         before they are rolled back.
+        Value is in number of seconds or null.
         """
-        return self._rollback_timer is not None
+        if self._rollback_timer:
+            remaining = self._rollback_timer.when() - asyncio.get_event_loop().time()
+            if remaining > 0:
+                return remaining
 
     @accepts(Dict(
         'options',
@@ -625,6 +653,7 @@ class InterfaceService(CRUDService):
         within this period of time the changes will get reverted.
         """
         await self.__check_failover_disabled()
+        await self.__check_dhcp_or_aliases()
         try:
             await self.sync()
         except Exception:
@@ -643,7 +672,7 @@ class InterfaceService(CRUDService):
     @accepts(Dict(
         'interface_create',
         Str('name'),
-        Str('description'),
+        Str('description', null=True),
         Str('type', enum=['BRIDGE', 'LINK_AGGREGATION', 'VLAN'], required=True),
         Bool('ipv4_dhcp', default=False),
         Bool('ipv6_auto', default=False),
@@ -1870,14 +1899,20 @@ class InterfaceService(CRUDService):
     @accepts(
         Dict(
             'ips',
-            Bool('ipv4'),
-            Bool('ipv6')
+            Bool('ipv4', default=True),
+            Bool('ipv6', default=True),
+            Bool('loopback', default=False),
+            Bool('any', default=False),
         )
     )
     def ip_in_use(self, choices=None):
         """
-        Get all IPv4 / Ipv6 from all valid interfaces, excluding lo0, bridge* and tap*.
-        Choices is a dictionary with defaults to {'ipv4': True, 'ipv6': True}
+        Get all IPv4 / Ipv6 from all valid interfaces, excluding bridge, tap and epair.
+
+        `loopback` will return loopback interface addresses.
+
+        `any` will return wildcard addresses (0.0.0.0 and ::).
+
         Returns a list of dicts - eg -
 
         [
@@ -1895,25 +1930,37 @@ class InterfaceService(CRUDService):
         ]
 
         """
-        if not choices:
-            choices = {
-                'ipv4': True,
-                'ipv6': True
-            }
-
-        ipv4 = choices['ipv4'] if choices.get('ipv4') else False
-        ipv6 = choices['ipv6'] if choices.get('ipv6') else False
         list_of_ip = []
-        ignore_nics = ('lo', 'bridge', 'tap', 'epair', 'pflog')
-        for if_name, iface in list(netif.list_interfaces().items()):
-            if not if_name.startswith(ignore_nics):
+        ignore_nics = ['bridge', 'tap', 'epair', 'pflog']
+        if not choices['loopback']:
+            ignore_nics.append('lo')
+        ignore_nics = tuple(ignore_nics)
+
+        if choices['any']:
+            if choices['ipv4']:
+                list_of_ip.append({
+                    'type': 'INET',
+                    'address': '0.0.0.0',
+                    'netmask': 0,
+                    'brodcast': '255.255.255.255',
+                })
+            if choices['ipv6']:
+                list_of_ip.append({
+                    'type': 'INET6',
+                    'address': '::',
+                    'netmask': 0,
+                    'brodcast': 'ff02::1',
+                })
+
+        for iface in list(netif.list_interfaces().values()):
+            if not iface.orig_name.startswith(ignore_nics):
                 aliases_list = iface.__getstate__()['aliases']
                 for alias_dict in aliases_list:
 
-                    if ipv4 and alias_dict['type'] == 'INET':
+                    if choices['ipv4'] and alias_dict['type'] == 'INET':
                         list_of_ip.append(alias_dict)
 
-                    if ipv6 and alias_dict['type'] == 'INET6':
+                    if choices['ipv6'] and alias_dict['type'] == 'INET6':
                         list_of_ip.append(alias_dict)
 
         return list_of_ip

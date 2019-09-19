@@ -1,8 +1,9 @@
 from collections import defaultdict, namedtuple
 import copy
-from datetime import datetime
+from datetime import datetime, timezone
 import errno
 import os
+import textwrap
 import time
 import traceback
 import uuid
@@ -12,6 +13,7 @@ from middlewared.alert.base import (
     alert_category_names,
     AlertClass,
     OneShotAlertClass,
+    SimpleOneShotAlertClass,
     DismissableAlertClass,
     AlertLevel,
     Alert,
@@ -28,6 +30,7 @@ from middlewared.service import (
     job, periodic, private,
 )
 from middlewared.service_exception import CallError
+from middlewared.validators import validate_attributes
 from middlewared.utils import bisect, load_modules, load_classes
 
 POLICIES = ["IMMEDIATELY", "HOURLY", "DAILY", "NEVER"]
@@ -42,15 +45,37 @@ AlertSourceLock = namedtuple("AlertSourceLock", ["source_name", "expires_at"])
 class AlertSourceRunFailedAlertClass(AlertClass):
     category = AlertCategory.SYSTEM
     level = AlertLevel.CRITICAL
-    title = "Failed to check for alert"
+    title = "Alert Check Failed"
     text = "Failed to check for alert %(source_name)s:\n%(traceback)s"
+
+    exclude_from_list = True
 
 
 class AlertSourceRunFailedOnBackupNodeAlertClass(AlertClass):
     category = AlertCategory.SYSTEM
     level = AlertLevel.CRITICAL
-    title = "Failed to check for alert on backup node"
-    text = "Failed to check for alert %(source_name)s on backup node:\n%(traceback)s"
+    title = "Alert Check Failed (Standby Controller)"
+    text = "Failed to check for alert %(source_name)s on standby controller:\n%(traceback)s"
+
+    exclude_from_list = True
+
+
+class AutomaticAlertFailedAlertClass(AlertClass, SimpleOneShotAlertClass):
+    category = AlertCategory.SYSTEM
+    level = AlertLevel.WARNING
+    title = "Failed to Notify iXsystems About Alert"
+    text = textwrap.dedent("""\
+        Creating an automatic alert for iXsystems about system %(serial)s failed: %(error)s.
+        Please contact iXsystems Support: https://www.ixsystems.com/support/
+
+        Alert:
+
+        %(alert)s
+    """)
+
+    exclude_from_list = True
+
+    deleted_automatically = False
 
 
 class TestAlertClass(AlertClass):
@@ -93,9 +118,11 @@ class AlertService(Service):
         self.blocked_failover_alerts_until = 0
 
     @private
-    async def initialize(self):
+    async def initialize(self, load=True):
+        is_freenas = await self.middleware.call("system.is_freenas")
+
         self.node = "A"
-        if not await self.middleware.call("system.is_freenas"):
+        if not is_freenas:
             if await self.middleware.call("failover.node") == "B":
                 self.node = "B"
 
@@ -105,6 +132,9 @@ class AlertService(Service):
         for sources_dir in sources_dirs:
             for module in load_modules(sources_dir):
                 for cls in load_classes(module, AlertSource, (FilePresenceAlertSource, ThreadedAlertSource)):
+                    if not is_freenas and cls.freenas_only:
+                        continue
+
                     source = cls(self.middleware)
                     ALERT_SOURCES[source.name] = source
 
@@ -118,23 +148,24 @@ class AlertService(Service):
                     ALERT_SERVICES_FACTORIES[cls.name()] = cls
 
         self.alerts = []
-        for alert in await self.middleware.call("datastore.query", "system.alert"):
-            del alert["id"]
+        if load:
+            for alert in await self.middleware.call("datastore.query", "system.alert"):
+                del alert["id"]
 
-            try:
-                alert["klass"] = AlertClass.class_by_name[alert["klass"]]
-            except KeyError:
-                self.logger.info("Alert class %r is no longer present", alert["klass"])
-                continue
+                try:
+                    alert["klass"] = AlertClass.class_by_name[alert["klass"]]
+                except KeyError:
+                    self.logger.info("Alert class %r is no longer present", alert["klass"])
+                    continue
 
-            alert["_uuid"] = alert.pop("uuid")
-            alert["_source"] = alert.pop("source")
-            alert["_key"] = alert.pop("key")
-            alert["_text"] = alert.pop("text")
+                alert["_uuid"] = alert.pop("uuid")
+                alert["_source"] = alert.pop("source")
+                alert["_key"] = alert.pop("key")
+                alert["_text"] = alert.pop("text")
 
-            alert = Alert(**alert)
+                alert = Alert(**alert)
 
-            self.alerts.append(alert)
+                self.alerts.append(alert)
 
         self.alert_source_last_run = defaultdict(lambda: datetime.min)
 
@@ -164,6 +195,11 @@ class AlertService(Service):
         List all types of alert sources which the system can issue.
         """
 
+        is_freenas = await self.middleware.call("system.is_freenas")
+
+        classes = [alert_class for alert_class in AlertClass.classes
+                   if not alert_class.exclude_from_list and not (not is_freenas and alert_class.freenas_only)]
+
         return [
             {
                 "id": alert_category.name,
@@ -174,14 +210,14 @@ class AlertService(Service):
                             "id": alert_class.name,
                             "title": alert_class.title,
                         }
-                        for alert_class in AlertClass.classes
+                        for alert_class in classes
                         if alert_class.category == alert_category
                     ],
                     key=lambda klass: klass["title"]
                 )
             }
             for alert_category in AlertCategory
-            if any(alert_class.category == alert_category for alert_class in AlertClass.classes)
+            if any(alert_class.category == alert_category for alert_class in classes)
         ]
 
     @private
@@ -278,7 +314,7 @@ class AlertService(Service):
 
     @periodic(60)
     @private
-    @job(lock="process_alerts", transient=True)
+    @job(lock="process_alerts", transient=True, lock_queue_size=1)
     async def process_alerts(self, job):
         if not await self.__should_run_or_send_alerts():
             return
@@ -297,7 +333,7 @@ class AlertService(Service):
     async def send_alerts(self, job):
         classes = (await self.middleware.call("alertclasses.config"))["classes"]
 
-        now = datetime.now()
+        now = datetime.utcnow()
         for policy_name, policy in self.policies.items():
             gone_alerts, new_alerts = policy.receive_alerts(now, self.alerts)
 
@@ -311,7 +347,7 @@ class AlertService(Service):
 
                         classes.get(alert.klass.name, {}).get("policy", DEFAULT_POLICY) == policy_name and
 
-                        not issubclass(alert.klass, OneShotAlertClass)
+                        not (issubclass(alert.klass, OneShotAlertClass) and not alert.klass.deleted_automatically)
                     )
                 ]
                 service_new_alerts = [
@@ -370,20 +406,23 @@ class AlertService(Service):
                                 if value:
                                     msg += ["", "{}: {}".format(verbose_name, value)]
 
-                            try:
-                                await self.middleware.call("support.new_ticket", {
-                                    "title": "Automatic alert (%s)" % serial,
-                                    "body": "\n".join(msg),
-                                    "attach_debug": False,
-                                    "category": "Hardware",
-                                    "criticality": "Loss of Functionality",
-                                    "environment": "Production",
-                                    "name": "Automatic Alert",
-                                    "email": "auto-support@ixsystems.com",
-                                    "phone": "-",
-                                })
-                            except Exception:
-                                self.logger.error(f"Failed to create a support ticket", exc_info=True)
+                            msg = "\n".join(msg)
+
+                            job = await self.middleware.call("support.new_ticket", {
+                                "title": "Automatic alert (%s)" % serial,
+                                "body": msg,
+                                "attach_debug": False,
+                                "category": "Hardware",
+                                "criticality": "Loss of Functionality",
+                                "environment": "Production",
+                                "name": "Automatic Alert",
+                                "email": "auto-support@ixsystems.com",
+                                "phone": "-",
+                            })
+                            await job.wait()
+                            if job.error:
+                                await self.middleware.call("alert.oneshot_create", "AutomaticAlertFailed",
+                                                           {"serial": serial, "alert": msg, "error": str(job.error)})
 
     def __uuid(self):
         return str(uuid.uuid4())
@@ -468,34 +507,28 @@ class AlertService(Service):
                             alerts_b = await self.middleware.call("failover.call_remote", "alert.run_source",
                                                                   [alert_source.name])
 
-                            alerts_b = [Alert(**dict(alert,
-                                                     level=(AlertLevel(alert["level"]) if alert["level"] is not None
-                                                            else alert["level"])))
+                            alerts_b = [Alert(**dict({k: v for k, v in alert.items()
+                                                      if k in ["args", "datetime", "dismissed", "mail"]},
+                                                     klass=AlertClass.class_by_name[alert["klass"]],
+                                                     _source=alert["source"],
+                                                     _key=alert["key"]))
                                         for alert in alerts_b]
                     except CallError as e:
-                        if e.errno == CallError.EALERTCHECKERUNAVAILABLE:
+                        if e.errno in [errno.ECONNREFUSED, errno.EHOSTDOWN, errno.ETIMEDOUT,
+                                       CallError.EALERTCHECKERUNAVAILABLE]:
                             pass
                         else:
                             raise
-                except Exception as e:
-                    if isinstance(e, CallError) and e.errno in [errno.ECONNREFUSED, errno.EHOSTDOWN, errno.ETIMEDOUT]:
-                        alerts_b = [
-                            Alert(AlertSourceRunFailedOnBackupNodeAlertClass,
-                                  args={
-                                      "source_name": alert_source.name,
-                                      "traceback": str(e),
-                                  },
-                                  _source=alert_source.name)
-                        ]
-                    else:
-                        alerts_b = [
-                            Alert(AlertSourceRunFailedOnBackupNodeAlertClass,
-                                  args={
-                                      "source_name": alert_source.name,
-                                      "traceback": traceback.format_exc(),
-                                  },
-                                  _source=alert_source.name)
-                        ]
+                except Exception:
+                    alerts_b = [
+                        Alert(AlertSourceRunFailedOnBackupNodeAlertClass,
+                              args={
+                                  "source_name": alert_source.name,
+                                  "traceback": traceback.format_exc(),
+                              },
+                              _source=alert_source.name)
+                    ]
+
             for alert in alerts_b:
                 alert.node = backup_node
 
@@ -523,6 +556,8 @@ class AlertService(Service):
             alert.uuid = existing_alert.uuid
         if existing_alert is None:
             alert.datetime = alert.datetime or datetime.utcnow()
+            if alert.datetime.tzinfo is not None:
+                alert.datetime = alert.datetime.astimezone(timezone.utc).replace(tzinfo=None)
         else:
             alert.datetime = existing_alert.datetime
         if existing_alert is None:
@@ -550,8 +585,9 @@ class AlertService(Service):
 
     @private
     async def unblock_source(self, lock):
-        source_lock = self.sources_locks.pop(lock)
-        self.blocked_sources[source_lock.source_name].remove(lock)
+        source_lock = self.sources_locks.pop(lock, None)
+        if source_lock:
+            self.blocked_sources[source_lock.source_name].remove(lock)
 
     @private
     async def block_failover_alerts(self):
@@ -696,6 +732,8 @@ class AlertServiceService(CRUDService):
 
     @private
     async def _compress(self, service):
+        service.pop("type__title")
+
         return service
 
     @private
@@ -707,10 +745,8 @@ class AlertServiceService(CRUDService):
             verrors.add(f"{schema_name}.type", "This field has invalid value")
             raise verrors
 
-        try:
-            factory.validate(service.get('attributes', {}))
-        except ValidationErrors as e:
-            verrors.add_child(f"{schema_name}.attributes", e)
+        verrors.add_child(f"{schema_name}.attributes",
+                          validate_attributes(list(factory.schema.attrs.values()), service))
 
         if verrors:
             raise verrors
@@ -776,11 +812,11 @@ class AlertServiceService(CRUDService):
         new = old.copy()
         new.update(data)
 
-        await self._validate(data, "alert_service_update")
+        await self._validate(new, "alert_service_update")
 
-        await self._compress(data)
+        await self._compress(new)
 
-        await self.middleware.call("datastore.update", self._config.datastore, id, data)
+        await self.middleware.call("datastore.update", self._config.datastore, id, new)
 
         await self._extend(new)
 
@@ -834,10 +870,16 @@ class AlertServiceService(CRUDService):
                               data["type"], data["attributes"], exc_info=True)
             return False
 
+        master_node = "A"
+        if not await self.middleware.call("system.is_freenas"):
+            if await self.middleware.call("notifier.failover_licensed"):
+                master_node = await self.middleware.call("failover.node")
+
         test_alert = Alert(
             TestAlertClass,
-            node="A",
+            node=master_node,
             datetime=datetime.utcnow(),
+            _uuid="test",
         )
 
         try:

@@ -89,7 +89,7 @@ class throttle(object):
             if time_since_last_call > self.throttle_period:
                 self.last_calls[key] = now
                 return fn(*args, **kwargs)
-            raise self.exc_class('{fn!r} called too many times')
+            raise self.exc_class(f'{fn!r} called too many times')
 
         @wraps(fn)
         async def async_wrapper(*args, **kwargs):
@@ -191,6 +191,7 @@ class ServiceBase(type):
             'service': None,
             'service_model': None,
             'service_verb': 'reload',
+            'service_verb_sync': True,
             'namespace': namespace,
             'namespace_alias': None,
             'private': False,
@@ -299,11 +300,16 @@ class SystemServiceService(ConfigService):
         )
 
     @private
-    async def _update_service(self, old, new):
+    async def _update_service(self, old, new, verb=None):
         await self.middleware.call('datastore.update',
                                    f'services.{self._config.service_model or self._config.service}', old['id'], new,
                                    {'prefix': self._config.datastore_prefix})
-        await self._service_change(self._config.service, self._config.service_verb)
+
+        fut = self._service_change(self._config.service, verb or self._config.service_verb)
+        if self._config.service_verb_sync:
+            await fut
+        else:
+            asyncio.ensure_future(fut)
 
 
 class CRUDService(ServiceChangeMixin, Service):
@@ -386,7 +392,8 @@ class CRUDService(ServiceChangeMixin, Service):
             f.append(('id', '!=', id))
         instance = await self.middleware.call(f'{self._config.namespace}.query', f)
         if instance:
-            verrors.add(f'{schema_name}.{field_name}', f'Object with this {field_name} already exists')
+            verrors.add('.'.join(filter(None, [schema_name, field_name])),
+                        f'Object with this {field_name} already exists')
 
 
 class CoreService(Service):
@@ -398,6 +405,16 @@ class CoreService(Service):
             i.__encode__() for i in list(self.middleware.jobs.all().values())
         ], filters, options)
         return jobs
+
+    @accepts(Int('id'))
+    @job()
+    def job_wait(self, job, id):
+        target_job = self.middleware.jobs.get(id)
+        target_job.wait_sync()
+        if target_job.error:
+            raise CallError(target_job.error)
+        else:
+            return target_job.result
 
     @accepts(Int('id'), Dict(
         'job-update',
@@ -549,7 +566,7 @@ class CoreService(Service):
 
                 accepts = getattr(method, 'accepts', None)
                 if accepts:
-                    accepts = [i.to_json_schema() for i in accepts]
+                    accepts = [i.to_json_schema() for i in accepts if not getattr(i, 'hidden', False)]
 
                 data['{0}.{1}'.format(name, attr)] = {
                     'description': doc,
@@ -560,6 +577,8 @@ class CoreService(Service):
                     'filterable': hasattr(method, '_filterable'),
                     'require_websocket': hasattr(method, '_pass_app'),
                     'job': hasattr(method, '_job'),
+                    'downloadable': hasattr(method, '_job') and method._job['pipes'] == ['output'],
+
                 }
         return data
 

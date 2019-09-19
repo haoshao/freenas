@@ -553,6 +553,10 @@ class Replication(Model):
     repl_exclude = ListField(
         verbose_name=_("Exclude child datasets"),
     )
+    repl_properties = models.BooleanField(
+        default=True,
+        verbose_name=_("Send dataset properties along with snapshots"),
+    )
     repl_periodic_snapshot_tasks = models.ManyToManyField(
         "Task",
         related_name="replication_tasks",
@@ -741,7 +745,7 @@ class Replication(Model):
         ),
     )
     repl_embed = models.BooleanField(
-        default=True,
+        default=False,
         verbose_name=_('Allow WRITE_EMBEDDED records'),
         help_text=_(
             'Generate a more compact stream by using WRITE_EMBEDDED '
@@ -794,6 +798,10 @@ class Replication(Model):
         help_text=_(
             'Disabling will not stop any replications which are in progress.'
         ),
+    )
+    repl_state = models.TextField(
+        default="{}",
+        editable=False,
     )
 
     class Meta:

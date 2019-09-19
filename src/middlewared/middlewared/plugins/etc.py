@@ -72,11 +72,6 @@ class EtcService(Service):
         'afpd': [
             {'type': 'py', 'path': 'afpd'},
         ],
-        'asigra': [
-            {'type': 'mako', 'path': 'dssys.cfg'},
-            {'type': 'mako', 'path': 'libmap.conf'},
-            {'type': 'mako', 'path': 'local/pam.d/dssystem'},
-        ],
         'cron': [
             {'type': 'mako', 'path': 'crontab'},
         ],
@@ -99,7 +94,6 @@ class EtcService(Service):
             {'type': 'mako', 'path': 'nsswitch.conf'},
             {'type': 'mako', 'path': 'local/nslcd.conf',
                 'owner': 'nslcd', 'group': 'nslcd', 'mode': 0o0400},
-            {'type': 'mako', 'path': 'local/nss_ldap.conf'},
         ],
         'pam': [
             {'type': 'mako', 'path': os.path.join('pam.d', f)}
@@ -215,7 +209,7 @@ class EtcService(Service):
         ]
     }
 
-    SKIP_LIST = ['system_dataset', 'collectd', 'syslogd']
+    SKIP_LIST = ['system_dataset', 'collectd', 'syslogd', 'smb_configure']
 
     class Config:
         private = True

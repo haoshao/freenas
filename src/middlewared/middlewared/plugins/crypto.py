@@ -218,7 +218,7 @@ class CryptoKeyService(Service):
         return t2.ctime()
 
     @accepts(
-        Str('certificate', required=True)
+        Str('certificate', required=True, max_length=None)
     )
     def load_certificate(self, certificate):
         try:
@@ -301,7 +301,7 @@ class CryptoKeyService(Service):
         return cert_info
 
     @accepts(
-        Str('csr', required=True)
+        Str('csr', required=True, max_length=None)
     )
     def load_certificate_request(self, csr):
         try:
@@ -396,8 +396,8 @@ class CryptoKeyService(Service):
             Int('key_length'),
             Int('serial', required=False, null=True),
             Int('lifetime', required=True),
-            Str('ca_certificate', required=False),
-            Str('ca_privatekey', required=False),
+            Str('ca_certificate', required=False, max_length=None),
+            Str('ca_privatekey', required=False, max_length=None),
             Str('key_type', required=False),
             Str('ec_curve', required=False),
             Str('country', required=True),
@@ -507,6 +507,8 @@ class CryptoKeyService(Service):
             ), True
         ).add_extension(
             x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False
+        ).add_extension(
+            x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), False
         ).public_key(
             key.public_key()
         )
@@ -525,10 +527,10 @@ class CryptoKeyService(Service):
     @accepts(
         Dict(
             'sign_csr',
-            Str('ca_certificate', required=True),
-            Str('ca_privatekey', required=True),
-            Str('csr', required=True),
-            Str('csr_privatekey', required=True),
+            Str('ca_certificate', required=True, max_length=None),
+            Str('ca_privatekey', required=True, max_length=None),
+            Str('csr', required=True, max_length=None),
+            Str('csr_privatekey', required=True, max_length=None),
             Int('serial', required=True),
             Str('digest_algorithm', default='SHA256')
         )
@@ -1021,7 +1023,7 @@ class CertificateService(CRUDService):
                     f'DNS challenge {"completed" if status else "failed"} for {domain}'
                 )
 
-    @periodic(86400, run_on_start=True)
+    @periodic(86400, run_on_start=False)
     @private
     @job(lock='acme_cert_renewal')
     def renew_certs(self, job):
@@ -1110,11 +1112,11 @@ class CertificateService(CRUDService):
             Int('lifetime'),
             Int('serial', validators=[Range(min=1)]),
             Str('acme_directory_uri'),
-            Str('certificate'),
+            Str('certificate', max_length=None),
             Str('city'),
-            Str('common'),
+            Str('common', max_length=None),
             Str('country'),
-            Str('CSR'),
+            Str('CSR', max_length=None),
             Str('ec_curve', enum=CryptoKeyService.ec_curves, default=CryptoKeyService.ec_curve_default),
             Str('email', validators=[Email()]),
             Str('key_type', enum=['RSA', 'EC'], default='RSA'),
@@ -1122,7 +1124,7 @@ class CertificateService(CRUDService):
             Str('organization'),
             Str('organizational_unit'),
             Str('passphrase'),
-            Str('privatekey'),
+            Str('privatekey', max_length=None),
             Str('state'),
             Str('create_type', enum=[
                 'CERTIFICATE_CREATE_INTERNAL', 'CERTIFICATE_CREATE_IMPORTED',
@@ -1340,9 +1342,9 @@ class CertificateService(CRUDService):
     @accepts(
         Dict(
             'create_imported_csr',
-            Str('CSR', required=True),
+            Str('CSR', required=True, max_length=None),
             Str('name'),
-            Str('privatekey', required=True),
+            Str('privatekey', required=True, max_length=None),
             Str('passphrase')
         )
     )
@@ -1370,10 +1372,10 @@ class CertificateService(CRUDService):
         Dict(
             'certificate_create_imported',
             Int('csr_id'),
-            Str('certificate', required=True),
+            Str('certificate', required=True, max_length=None),
             Str('name'),
             Str('passphrase'),
-            Str('privatekey')
+            Str('privatekey', max_length=None)
         )
     )
     @skip_arg(count=1)
@@ -1928,6 +1930,8 @@ class CertificateAuthorityService(CRUDService):
             {'prefix': 'cert_'}
         )
 
+        await self.middleware.call('service.start', 'ssl')
+
         return await self.middleware.call(
             'certificate.query',
             [['id', '=', new_csr_id]],
@@ -2119,9 +2123,15 @@ class CertificateAuthorityService(CRUDService):
 
 
 async def setup(middlewared):
-    system_cert = (await middlewared.call('system.general.config'))['ui_certificate']
-    certs = await middlewared.call('certificate.query')
-    if not system_cert or system_cert['id'] not in [c['id'] for c in certs]:
+    failure = False
+    try:
+        system_cert = (await middlewared.call('system.general.config'))['ui_certificate']
+        certs = await middlewared.call('certificate.query')
+    except Exception as e:
+        failure = True
+        middlewared.logger.error(f'Failed to retrieve certificates: {e}', exc_info=True)
+
+    if not failure and (not system_cert or system_cert['id'] not in [c['id'] for c in certs]):
         # create a self signed cert if it doesn't exist and set ui_certificate to it's value
         try:
             if not any('freenas_default' == c['name'] for c in certs):
@@ -2150,6 +2160,8 @@ async def setup(middlewared):
 
             await middlewared.call('system.general.update', {'ui_certificate': id})
         except Exception as e:
+            failure = True
             middlewared.logger.debug(f'Failed to set certificate for system.general plugin: {e}')
 
-    middlewared.logger.debug('Certificate setup for System complete')
+    if not failure:
+        middlewared.logger.debug('Certificate setup for System complete')

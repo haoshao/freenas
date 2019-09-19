@@ -30,7 +30,6 @@ from django.utils.translation import ugettext_lazy as _
 from freenasUI import choices
 from freenasUI.freeadmin.models import Model, UserField, GroupField, PathField
 from freenasUI.freeadmin.models.fields import MultiSelectField
-from freenasUI.middleware.notifier import notifier
 
 
 class CIFS_Share(Model):
@@ -85,7 +84,10 @@ class CIFS_Share(Model):
         verbose_name=_('Allow Guest Access'),
         help_text=_(
             'If true then no password is required to connect to the share. '
-            'Privileges will be those of the guest account.'
+            'Privileges are the same as the guest account. Guest access is '
+            'disabled by default in Windows 10 version 1709 and Windows Server version 1903. '
+            'Additional client-side configuration is required to provide '
+            'guest access to these clients.'
         ),
         default=False,
     )
@@ -129,12 +131,17 @@ class CIFS_Share(Model):
         verbose_name=_('VFS Objects'),
         max_length=255,
         blank=True,
-        default='zfs_space,zfsacl,streams_xattr',
+        default=['ixnas', 'streams_xattr'],
         choices=list(choices.CIFS_VFS_OBJECTS())
     )
     cifs_vuid = models.CharField(
         max_length=36,
         verbose_name=_('vuid for Time Machine'),
+        blank=True,
+        editable=False,
+    )
+    cifs_share_acl = models.TextField(
+        verbose_name=_('SMB Share ACL'),
         blank=True,
         editable=False,
     )
@@ -144,6 +151,10 @@ class CIFS_Share(Model):
         help_text=_(
             "These parameters are added to [Share] section of smb.conf"
         )
+    )
+    cifs_enabled = models.BooleanField(
+        verbose_name=_("Enabled"),
+        default=True,
     )
 
     def __str__(self):
@@ -287,6 +298,12 @@ class AFP_Share(Model):
         help_text=_("Deny listed hosts and/or networks access to this volume"),
         verbose_name=_("Hosts Deny")
     )
+    afp_vuid = models.CharField(
+        max_length=36,
+        verbose_name=_('vuid for Time Machine'),
+        blank=True,
+        editable=False,
+    )
 
     afp_auxparams = models.TextField(
         blank=True,
@@ -296,6 +313,10 @@ class AFP_Share(Model):
             " Add each different parameter on a newline"
         ),
         verbose_name=_("Auxiliary Parameters")
+    )
+    afp_enabled = models.BooleanField(
+        verbose_name=_("Enabled"),
+        default=True,
     )
 
     def __str__(self):
@@ -405,6 +426,10 @@ class NFS_Share(Model):
             ('krb5i', 'krb5i'),
             ('krb5p', 'krb5p'),
         ),
+    )
+    nfs_enabled = models.BooleanField(
+        verbose_name=_("Enabled"),
+        default=True,
     )
 
     def __str__(self):

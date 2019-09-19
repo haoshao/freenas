@@ -46,12 +46,14 @@ def test_01_creating_smb_dataset():
 
 @ad_test_cfg
 def test_02_enabling_active_directory():
-    payload = {"ad_bindpw": ADPASSWORD,
-               "ad_bindname": ADUSERNAME,
-               "ad_domainname": BRIDGEDOMAIN,
-               "ad_netbiosname_a": BRIDGEHOST,
-               "ad_idmap_backend": "rid",
-               "ad_enable": True}
+    payload = {
+        "ad_bindpw": ADPASSWORD,
+        "ad_bindname": ADUSERNAME,
+        "ad_domainname": BRIDGEDOMAIN,
+        "ad_netbiosname": BRIDGEHOST,
+        "ad_idmap_backend": "rid",
+        "ad_enable": True
+    }
     results = PUT("/directoryservice/activedirectory/1/", payload)
     assert results.status_code == 200, results.text
 
@@ -182,6 +184,7 @@ def test_18_Unmounting_SMB():
 
 
 # Update tests
+@bsd_host_cfg
 @ad_test_cfg
 def test_19_Mounting_SMB():
     cmd = 'mount_smbfs -N -I %s -W AD01 ' % ip
@@ -230,6 +233,7 @@ def test_24_Deleting_SMB_file_2_2():
     assert results['result'] is True, results['output']
 
 
+@bsd_host_cfg
 @ad_test_cfg
 def test_25_Unmounting_SMB():
     results = SSH_TEST('umount "%s"' % MOUNTPOINT,
@@ -248,13 +252,13 @@ def test_26_Removing_SMB_mountpoint():
 
 # Disable Active Directory Directory
 @ad_test_cfg
-def test_27_Disabling_Active_Directory():
-    payload = {"ad_bindpw": ADPASSWORD,
-               "ad_bindname": ADUSERNAME,
-               "ad_domainname": BRIDGEDOMAIN,
-               "ad_netbiosname_a": BRIDGEHOST,
-               "ad_idmap_backend": "ad",
-               "ad_enable": False}
+def test_27_Disabling_Active_Directory_and_clear_kerberos_principal():
+    payload = {
+        "ad_netbiosname": BRIDGEHOST,
+        "ad_idmap_backend": "ad",
+        "ad_kerberos_principal": "",
+        "ad_enable": False
+    }
     results = PUT("/directoryservice/activedirectory/1/", payload)
     assert results.status_code == 200, results.text
 
@@ -267,13 +271,18 @@ def test_28_Verify_Active_Directory_is_disabled():
     sleep(1)
 
 
-@ad_test_cfg
-def test_29_Verify_SMB_service_is_disabled():
+def test_29_Stop_SMB_service():
+    results = PUT("/services/services/cifs/", {"srv_enable": False})
+    assert results.status_code == 200, results.text
+    sleep(1)
+
+
+def test_30_Verify_SMB_service_is_disabled():
     results = GET("/services/services/cifs/")
     assert results.json()["srv_state"] == "STOPPED", results.text
 
 
-def test_30_Delete_cifs_share_on_SMB_PATH():
+def test_31_Delete_cifs_share_on_SMB_PATH():
     payload = {"cifs_comment": "My Test SMB Share",
                "cifs_path": SMB_PATH,
                "cifs_name": SMB_NAME,
@@ -284,6 +293,6 @@ def test_30_Delete_cifs_share_on_SMB_PATH():
 
 
 # Check destroying a SMB dataset
-def test_31_Destroying_SMB_dataset():
+def test_32_Destroying_SMB_dataset():
     results = DELETE(f"/storage/volume/{pool_name}/datasets/{DATASET}/")
     assert results.status_code == 204, results.text

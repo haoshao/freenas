@@ -28,6 +28,13 @@ class DiskFAdmin(BaseFreeAdmin):
     )
     resource_mixin = DiskResourceMixin
 
+    def edit(self, request, oid, mf=None):
+        if request.method == 'POST':
+            request.POST._mutable = True
+            request.POST.pop('disk_serial', None)
+            request.POST._mutable = False
+        return super(DiskFAdmin, self).edit(request, oid, mf)
+
     def get_actions(self):
         actions = super(DiskFAdmin, self).get_actions()
         del actions['Delete']
@@ -619,6 +626,7 @@ class TaskFAdmin(BaseFreeAdmin):
         'task_dayweek',
         'task_begin',
         'task_end',
+        'task_allow_empty',
     )
 
     def get_datagrid_columns(self):
@@ -690,6 +698,7 @@ class ReplicationFAdmin(BaseFreeAdmin):
         'repl_netcat_active_side_port_max',
         'repl_netcat_passive_side_connect_address',
         'repl_exclude',
+        'repl_properties',
         'repl_periodic_snapshot_tasks',
         'repl_naming_schema',
         'repl_schedule_minute',
@@ -719,6 +728,8 @@ class ReplicationFAdmin(BaseFreeAdmin):
         'repl_embed',
         'repl_compressed',
         'repl_retries',
+        'repl_logging_level',
+        'repl_state',
     )
     refresh_time = 12000
 
@@ -780,6 +791,7 @@ class LegacyReplicationFAdmin(BaseFreeAdmin):
         'repl_netcat_active_side_port_min',
         'repl_netcat_active_side_port_max',
         'repl_exclude',
+        'repl_properties',
         'repl_periodic_snapshot_tasks',
         'repl_naming_schema',
         'repl_schedule_minute',

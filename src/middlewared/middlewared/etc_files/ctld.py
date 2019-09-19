@@ -213,7 +213,8 @@ def main(middleware):
     zpoollist = middleware.call_sync('notifier.zpool_list')
 
     # Generate the LUN section
-    for extent in middleware.call_sync('datastore.query', 'services.iSCSITargetExtent'):
+    for extent in middleware.call_sync('datastore.query', 'services.iSCSITargetExtent',
+                                       [['iscsi_target_extent_enabled', '=', True]]):
         extent = Struct(extent)
         path = extent.iscsi_target_extent_path
         if not path:
@@ -384,12 +385,12 @@ def main(middleware):
         addline('}\n\n')
 
     # Write out the CTL config file
-    with open(os.open(ctl_config, os.O_CREAT | os.O_WRONLY, 0o600), 'w') as fh:
+    with open(os.open(ctl_config, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), 'w') as fh:
         for line in cf_contents:
             fh.write(line)
 
     # Write out the CTL config file with redacted CHAP passwords
-    with open(os.open(ctl_config_shadow, os.O_CREAT | os.O_WRONLY, 0o600), 'w') as fh:
+    with open(os.open(ctl_config_shadow, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), 'w') as fh:
         for line in cf_contents_shadow:
             fh.write(line)
 

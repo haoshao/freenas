@@ -11,17 +11,13 @@ from middlewared.utils.asyncio_ import asyncio_map
 logger = logging.getLogger(__name__)
 
 
-async def annotate_disk_for_smart(devices, disk):
-    if disk is None or "nvd" in disk:
-        return
-
-    device = devices.get(disk)
-    if device:
-        args = await get_smartctl_args(disk, device)
-        if args:
-            if await ensure_smart_enabled(args):
-                args.extend(["-d", "removable"])
-                return disk, dict(smartctl_args=args)
+async def annotate_disk_for_smart(middleware, devices, disk):
+    args = await get_smartctl_args(middleware, devices, disk)
+    if args:
+        if await ensure_smart_enabled(args):
+            args.extend(["-a"])
+            args.extend(["-d", "removable"])
+            return disk, dict(smartctl_args=args)
 
 
 async def ensure_smart_enabled(args):
@@ -50,12 +46,7 @@ def get_smartd_config(disk):
     config = f"{args} -n {disk['smart_powermode']} -W {difference}," \
              f"{informational},{critical}"
 
-    if disk['smart_email']:
-        config += f" -m {disk['smart_email']}"
-    else:
-        config += f" -m root"
-
-    config += " -M exec /usr/local/libexec/smart_alert.py"
+    config += " -m root -M exec /usr/local/libexec/smart_alert.py"
 
     if disk.get('smarttest_type'):
         config += f"\\\n-s {disk['smarttest_type']}/" + get_smartd_schedule(disk) + "\\\n"
@@ -85,11 +76,15 @@ def get_smartd_schedule_piece(value, min, max, enum=None):
 
     if value == "*":
         return "." * width
-    m = re.match("\*/([0-9]+)", value)
+    m = re.match(r"((?P<min>[0-9]+)-(?P<max>[0-9]+)|\*)/(?P<divisor>[0-9]+)", value)
     if m:
-        d = int(m.group(1))
-        if d == 1:
-            return "." * width
+        d = int(m.group("divisor"))
+        if m.group("min") is None:
+            if d == 1:
+                return "." * width
+        else:
+            min = int(m.group("min"))
+            max = int(m.group("max"))
         values = [v for v in range(min, max + 1) if v % d == 0]
     else:
         values = list(filter(lambda v: v is not None,
@@ -115,8 +110,8 @@ async def render(service, middleware):
     disks = [dict(disk, **smart_config) for disk in disks]
 
     devices = await camcontrol_list()
-    annotated = dict(filter(None, await asyncio_map(functools.partial(annotate_disk_for_smart, devices),
-                                                    {disk["disk_name"] for disk in disks},
+    annotated = dict(filter(None, await asyncio_map(functools.partial(annotate_disk_for_smart, middleware, devices),
+                                                    set(filter(None, {disk["disk_name"] for disk in disks})),
                                                     16)))
     disks = [dict(disk, **annotated[disk["disk_name"]]) for disk in disks if disk["disk_name"] in annotated]
 
